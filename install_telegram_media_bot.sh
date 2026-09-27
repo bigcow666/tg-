@@ -80,17 +80,111 @@ ffprobe -version | head -n 1
 echo "[7/10] 交互式配置机器人参数..."
 echo ""
 echo "=========================================="
-echo "请输入必填参数"
+echo "请输入必填参数（所有项都必须填写）"
 echo "=========================================="
 echo ""
 
-read -p "API_ID (Telegram 开发者平台): " API_ID
-read -p "API_HASH: " API_HASH
-read -p "BOT_TOKEN (@BotFather 获取): " BOT_TOKEN
-read -p "授权账号 User ID (多个用逗号分隔，如: 123456789,987654321): " ALLOWED_USERS_INPUT
-read -p "目标群 ID (例如: -1001234567890): " TARGET_CHAT_ID
+# API_ID 验证
+while true; do
+    read -p "API_ID (Telegram 开发者平台, 数字): " API_ID
+    if [[ -z "$API_ID" ]]; then
+        echo "❌ API_ID 不能为空，请重新输入"
+        continue
+    fi
+    if ! [[ "$API_ID" =~ ^[0-9]+$ ]]; then
+        echo "❌ API_ID 必须是数字，请重新输入"
+        continue
+    fi
+    break
+done
+
+# API_HASH 验证
+while true; do
+    read -p "API_HASH (32个字符的十六进制): " API_HASH
+    if [[ -z "$API_HASH" ]]; then
+        echo "❌ API_HASH 不能为空，请重新输入"
+        continue
+    fi
+    if ! [[ "$API_HASH" =~ ^[0-9a-fA-F]{32}$ ]]; then
+        echo "❌ API_HASH 格式错误，必须是32个十六进制字符，请重新输入"
+        continue
+    fi
+    break
+done
+
+# BOT_TOKEN 验证
+while true; do
+    read -p "BOT_TOKEN (@BotFather 获取): " BOT_TOKEN
+    if [[ -z "$BOT_TOKEN" ]]; then
+        echo "❌ BOT_TOKEN 不能为空，请重新输入"
+        continue
+    fi
+    if ! [[ "$BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then
+        echo "❌ BOT_TOKEN 格式错误，应为: 数字:字母数字_-"
+        continue
+    fi
+    break
+done
+
+# 所有者 Telegram ID 验证（防止滥用）
+while true; do
+    read -p "所有者 Telegram ID (防止VPS流量被滥用，必须是数字): " OWNER_ID
+    if [[ -z "$OWNER_ID" ]]; then
+        echo "❌ 所有者 ID 不能为空，请重新输入"
+        continue
+    fi
+    if ! [[ "$OWNER_ID" =~ ^[0-9]+$ ]]; then
+        echo "❌ 所有者 ID 必须是数字，请重新输入"
+        continue
+    fi
+    break
+done
+
+# ALLOWED_USERS 验证
+while true; do
+    read -p "授权账号 User ID (多个用逗号分隔，如: 123456789,987654321): " ALLOWED_USERS_INPUT
+    if [[ -z "$ALLOWED_USERS_INPUT" ]]; then
+        echo "❌ 授权账号不能为空，请至少输入一个，请重新输入"
+        continue
+    fi
+    # 验证格式：只能是数字和逗号
+    if ! [[ "$ALLOWED_USERS_INPUT" =~ ^[0-9,]+$ ]]; then
+        echo "❌ 授权账号格式错误，只能包含数字和逗号，请重新输入"
+        continue
+    fi
+    # 验证是否包含所有者ID
+    if [[ "$ALLOWED_USERS_INPUT" == *"$OWNER_ID"* ]]; then
+        break
+    else
+        echo "⚠️  警告：授权账号中不包含所有者ID ($OWNER_ID)"
+        read -p "是否继续？(y/n): " CONFIRM
+        if [ "$CONFIRM" = "y" ] || [ "$CONFIRM" = "Y" ]; then
+            break
+        fi
+    fi
+done
+
+# 目标群 ID 验证
+while true; do
+    read -p "目标群 ID (例如: -1001234567890): " TARGET_CHAT_ID
+    if [[ -z "$TARGET_CHAT_ID" ]]; then
+        echo "❌ 目标群 ID 不能为空，请重新输入"
+        continue
+    fi
+    if ! [[ "$TARGET_CHAT_ID" =~ ^-?[0-9]+$ ]]; then
+        echo "❌ 目标群 ID 必须是数字，请重新输入"
+        continue
+    fi
+    break
+done
+
+# MAX_CACHE_GB 验证（允许空值，使用默认值）
 read -p "缓存大小限制 (GB, 默认10): " MAX_CACHE_GB
 MAX_CACHE_GB=${MAX_CACHE_GB:-10}
+if ! [[ "$MAX_CACHE_GB" =~ ^[0-9]+$ ]]; then
+    echo "⚠️  缓存大小格式错误，使用默认值 10GB"
+    MAX_CACHE_GB=10
+fi
 
 echo ""
 echo "[8/10] 更新配置文件..."
@@ -178,6 +272,7 @@ echo "=========================================="
 echo ""
 echo "📋 配置信息："
 echo "  安装目录: $APP_DIR"
+echo "  所有者ID: $OWNER_ID"
 echo "  API_ID: $API_ID"
 echo "  API_HASH: ${API_HASH:0:16}..."
 echo "  BOT_TOKEN: ${BOT_TOKEN:0:20}..."
