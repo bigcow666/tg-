@@ -63,7 +63,7 @@ BOT_TOKEN = "1234567890:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 ```python
 ALLOWED_USERS = {
     123456789,
-    987654321,
+    987654321
 }
 ```
 
