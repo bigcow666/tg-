@@ -1,8 +1,19 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# 上传目录：
+# /root/telegram_media_bot.py/
+# ├── telegram_media_bot.py
+# └── install_telegram_media_bot.sh
+#
+# 最终运行目录：
+# /root/tg_media_bot/
+# └── telegram_media_bot.py
+
+UPLOAD_DIR="/root/telegram_media_bot.py"
+UPLOAD_PY="$UPLOAD_DIR/telegram_media_bot.py"
+
 APP_DIR="/root/tg_media_bot"
-ROOT_PY="/root/telegram_media_bot.py"
 APP="$APP_DIR/telegram_media_bot.py"
 VENV="$APP_DIR/venv"
 SERVICE="/etc/systemd/system/tg-media-bot.service"
@@ -16,18 +27,15 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-# 1. 检查上传到 /root 的程序
-if [ ! -f "$ROOT_PY" ] && [ ! -f "$APP" ]; then
-    echo "ERROR: 找不到 telegram_media_bot.py"
-    echo "请先把 telegram_media_bot.py 上传到 /root/"
+if [ ! -f "$UPLOAD_PY" ]; then
+    echo "ERROR: 找不到程序：$UPLOAD_PY"
+    echo "请确认两个文件位于：$UPLOAD_DIR/"
     exit 1
 fi
 
-echo
 echo "[1/10] 更新系统软件源..."
 apt-get update
 
-echo
 echo "[2/10] 安装系统依赖..."
 apt-get install -y \
     python3 \
@@ -35,55 +43,38 @@ apt-get install -y \
     python3-pip \
     python3-dev \
     build-essential \
-    gcc \
-    g++ \
-    make \
     pkg-config \
     ffmpeg \
     ca-certificates \
     curl \
     wget
 
-echo
-echo "[3/10] 创建程序目录..."
+echo "[3/10] 创建运行目录..."
 mkdir -p "$APP_DIR"
 mkdir -p "$APP_DIR/downloads"
 mkdir -p "$APP_DIR/cache"
 mkdir -p "$APP_DIR/logs"
 
-echo
-echo "[4/10] 移动程序..."
-
-# 新机器：/root/telegram_media_bot.py -> /root/tg_media_bot/telegram_media_bot.py
-if [ -f "$ROOT_PY" ]; then
-    if [ -f "$APP" ]; then
-        cp "$APP" "$APP.bak.$(date +%Y%m%d-%H%M%S)"
-    fi
-    mv "$ROOT_PY" "$APP"
+echo "[4/10] 部署程序..."
+if [ -f "$APP" ]; then
+    BACKUP="$APP.bak.$(date +%Y%m%d-%H%M%S)"
+    cp "$APP" "$BACKUP"
+    echo "旧程序已备份：$BACKUP"
 fi
 
-if [ ! -f "$APP" ]; then
-    echo "ERROR: 程序移动失败：$APP"
-    exit 1
-fi
+cp "$UPLOAD_PY" "$APP"
+chmod 755 "$APP"
 
-echo "程序位置：$APP"
+echo "程序已部署到：$APP"
 
-echo
-echo "[5/10] 创建 Python venv..."
-
+echo "[5/10] 创建 Python 虚拟环境..."
 if [ ! -d "$VENV" ]; then
     python3 -m venv "$VENV"
 fi
 
-"$VENV/bin/python" -m pip install --upgrade \
-    pip \
-    setuptools \
-    wheel
+"$VENV/bin/python" -m pip install --upgrade pip setuptools wheel
 
-echo
 echo "[6/10] 安装 Python 依赖..."
-
 "$VENV/bin/pip" install --upgrade \
     "telethon==1.45.0" \
     cryptg \
@@ -91,50 +82,31 @@ echo "[6/10] 安装 Python 依赖..."
     hachoir \
     aiohttp
 
-echo
 echo "[7/10] 检查环境..."
+"$VENV/bin/python" - <<'PY'
+import sys
+import telethon
+import cryptg
+import PIL
+import hachoir
+import aiohttp
 
-echo "Python:"
-"$VENV/bin/python" --version
+print("Python   :", sys.version.split()[0])
+print("Telethon :", telethon.__version__)
+print("cryptg   : OK")
+print("Pillow   :", PIL.__version__)
+print("hachoir  : OK")
+print("aiohttp  :", aiohttp.__version__)
+PY
 
-echo
-echo "Telethon:"
-"$VENV/bin/python" -c 'import telethon; print(telethon.__version__)'
-
-echo
-echo "cryptg:"
-"$VENV/bin/python" -c 'import cryptg; print("OK")'
-
-echo
-echo "Pillow:"
-"$VENV/bin/python" -c 'import PIL; print(PIL.__version__)'
-
-echo
-echo "hachoir:"
-"$VENV/bin/python" -c 'import hachoir; print("OK")'
-
-echo
-echo "aiohttp:"
-"$VENV/bin/python" -c 'import aiohttp; print(aiohttp.__version__)'
-
-echo
-echo "FFmpeg:"
 ffmpeg -version | head -n 1
-
-echo
-echo "FFprobe:"
 ffprobe -version | head -n 1
 
-echo
 echo "[8/10] 检查机器人代码..."
-
 "$VENV/bin/python" -m py_compile "$APP"
-
 echo "Python 语法检查：OK"
 
-echo
 echo "[9/10] 创建 systemd 保活服务..."
-
 cat > "$SERVICE" <<EOF
 [Unit]
 Description=Telegram Media Transfer Bot
@@ -158,11 +130,8 @@ EOF
 systemctl daemon-reload
 systemctl enable tg-media-bot
 
-echo
 echo "[10/10] 启动机器人..."
-
 systemctl restart tg-media-bot
-
 sleep 3
 
 echo
@@ -173,21 +142,11 @@ echo "=========================================="
 systemctl --no-pager --full status tg-media-bot
 
 echo
-echo "程序："
-echo "$APP"
-
-echo
-echo "Python 环境："
-echo "$VENV"
-
+echo "运行程序：$APP"
+echo "Python 环境：$VENV"
 echo
 echo "实时日志："
 echo "journalctl -u tg-media-bot -f"
-
 echo
 echo "重启："
 echo "systemctl restart tg-media-bot"
-
-echo
-echo "停止："
-echo "systemctl stop tg-media-bot"
