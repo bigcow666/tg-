@@ -2,7 +2,39 @@
 
 基于 Telethon 的 Telegram 机器人，用于读取消息链接中的媒体，并转存到指定目标群/频道。
 
-## 必填参数
+## 快速部署
+
+### 一键下载和部署
+
+```bash
+git clone https://github.com/bigcow666/tg-.git /root/tg_media_bot
+cd /root/tg_media_bot
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+### 配置参数
+
+编辑 `telegram_media_bot.py`，修改以下必填参数：
+
+```python
+API_ID = 12345678
+API_HASH = "0123456789abcdef0123456789abcdef"
+BOT_TOKEN = "1234567890:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ALLOWED_USERS = {123456789}
+DEFAULT_TARGET_CHAT_ID = -1001234567890
+```
+
+### 启动
+
+```bash
+python telegram_media_bot.py
+```
+
+---
+
+## 必填参数说明
 
 ### API_ID
 Telegram 开发者平台申请的 API ID。
@@ -39,7 +71,6 @@ ALLOWED_USERS = {
 - API_ID / API_HASH：Telegram API 凭证
 - BOT_TOKEN：机器人身份凭证
 - ALLOWED_USERS：白名单，只有这里列出的账号可以使用机器人
-- 三者不能混淆
 
 如何获取自己的 User ID：
 - 先给机器人发一条消息
@@ -61,7 +92,7 @@ ALLOWED_USERS = {
 目标群 ID 通常是数字形式，例如：
 
 ```python
-TARGET_CHAT_ID = -1001234567890
+DEFAULT_TARGET_CHAT_ID = -1001234567890
 ```
 
 注意：
@@ -89,35 +120,55 @@ TARGET_CHAT_ID = -1001234567890
 
 ---
 
-## systemd 管理
+## systemd 服务管理（可选）
 
-### 查看状态
+### 创建服务文件
+
 ```bash
-systemctl status tg-media-bot --no-pager -l
+sudo nano /etc/systemd/system/tg-media-bot.service
 ```
 
-### 启动
+写入以下内容：
+
+```ini
+[Unit]
+Description=Telegram Media Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/tg_media_bot
+ExecStart=/root/tg_media_bot/venv/bin/python -u /root/tg_media_bot/telegram_media_bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### 管理命令
+
 ```bash
+# 启动
 systemctl start tg-media-bot
-```
 
-### 停止
-```bash
+# 停止
 systemctl stop tg-media-bot
-```
 
-### 重启
-```bash
+# 重启
 systemctl restart tg-media-bot
-```
 
-### 查看日志
-```bash
+# 查看状态
+systemctl status tg-media-bot --no-pager -l
+
+# 开机自启
+systemctl enable tg-media-bot
+
+# 查看日志
 journalctl -u tg-media-bot -n 100 --no-pager
-```
 
-### 实时日志
-```bash
+# 实时日志
 journalctl -u tg-media-bot -f
 ```
 
@@ -126,8 +177,13 @@ journalctl -u tg-media-bot -f
 ## 修改代码后
 
 ```bash
+# 检查语法
 /root/tg_media_bot/venv/bin/python -m py_compile /root/tg_media_bot/telegram_media_bot.py
+
+# 重启服务
 systemctl restart tg-media-bot
+
+# 查看日志
 journalctl -u tg-media-bot -n 100 --no-pager
 ```
 
