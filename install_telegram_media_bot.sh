@@ -33,10 +33,10 @@ if [ ! -f "$UPLOAD_PY" ]; then
     exit 1
 fi
 
-echo "[1/10] 更新系统软件源..."
+echo "[1/11] 更新系统软件源..."
 apt-get update
 
-echo "[2/10] 安装系统依赖..."
+echo "[2/11] 安装系统依赖..."
 apt-get install -y \
     python3 \
     python3-venv \
@@ -49,13 +49,13 @@ apt-get install -y \
     curl \
     wget
 
-echo "[3/10] 创建运行目录..."
+echo "[3/11] 创建运行目录..."
 mkdir -p "$APP_DIR"
 mkdir -p "$APP_DIR/downloads"
 mkdir -p "$APP_DIR/cache"
 mkdir -p "$APP_DIR/logs"
 
-echo "[4/10] 部署程序..."
+echo "[4/11] 部署程序..."
 if [ -f "$APP" ]; then
     BACKUP="$APP.bak.$(date +%Y%m%d-%H%M%S)"
     cp "$APP" "$BACKUP"
@@ -67,14 +67,14 @@ chmod 755 "$APP"
 
 echo "程序已部署到：$APP"
 
-echo "[5/10] 创建 Python 虚拟环境..."
+echo "[5/11] 创建 Python 虚拟环境..."
 if [ ! -d "$VENV" ]; then
     python3 -m venv "$VENV"
 fi
 
 "$VENV/bin/python" -m pip install --upgrade pip setuptools wheel
 
-echo "[6/10] 安装 Python 依赖..."
+echo "[6/11] 安装 Python 依赖..."
 "$VENV/bin/pip" install --upgrade \
     "telethon==1.45.0" \
     cryptg \
@@ -82,7 +82,7 @@ echo "[6/10] 安装 Python 依赖..."
     hachoir \
     aiohttp
 
-echo "[7/10] 检查环境..."
+echo "[7/11] 检查环境..."
 "$VENV/bin/python" - <<'PY'
 import sys
 import telethon
@@ -102,11 +102,73 @@ PY
 ffmpeg -version | head -n 1
 ffprobe -version | head -n 1
 
-echo "[8/10] 检查机器人代码..."
+echo "[8/11] 交互式配置机器人参数..."
+echo ""
+echo "=========================================="
+echo "请输入必填参数（或按 Ctrl+C 跳过配置）"
+echo "=========================================="
+echo ""
+
+read -p "API_ID (Telegram 开发者平台): " API_ID
+read -p "API_HASH: " API_HASH
+read -p "BOT_TOKEN (@BotFather 获取): " BOT_TOKEN
+read -p "授权账号 User ID (多个用逗号分隔): " ALLOWED_USERS_INPUT
+read -p "目标群 ID (例如: -1001234567890): " TARGET_CHAT_ID
+read -p "缓存大小限制 (GB, 默认10): " MAX_CACHE_GB
+MAX_CACHE_GB=${MAX_CACHE_GB:-10}
+
+echo ""
+echo "✓ 更新配置文件..."
+
+# 使用 Python 修改配置文件（处理复杂的格式）
+"$VENV/bin/python" << PYSCRIPT
+import re
+
+# 读取配置文件
+with open('$APP', 'r', encoding='utf-8') as f:
+    content = f.read()
+
+# 修改 API_ID
+content = re.sub(r'^API_ID = .*', 'API_ID = $API_ID', content, flags=re.MULTILINE)
+
+# 修改 API_HASH
+content = re.sub(r'^API_HASH = .*', 'API_HASH = "$API_HASH"', content, flags=re.MULTILINE)
+
+# 修改 BOT_TOKEN
+content = re.sub(r'^BOT_TOKEN = .*', 'BOT_TOKEN = "$BOT_TOKEN"', content, flags=re.MULTILINE)
+
+# 修改 DEFAULT_TARGET_CHAT_ID
+content = re.sub(r'^DEFAULT_TARGET_CHAT_ID = .*', 'DEFAULT_TARGET_CHAT_ID = $TARGET_CHAT_ID', content, flags=re.MULTILINE)
+
+# 修改 MAX_CACHE_GB
+content = re.sub(r'^MAX_CACHE_GB = .*', 'MAX_CACHE_GB = $MAX_CACHE_GB', content, flags=re.MULTILINE)
+
+# 修改 ALLOWED_USERS
+users = "$ALLOWED_USERS_INPUT".split(',')
+users = [int(u.strip()) for u in users if u.strip()]
+allowed_users_str = "ALLOWED_USERS = {\n"
+for i, user in enumerate(users):
+    if i < len(users) - 1:
+        allowed_users_str += f"    {user},\n"
+    else:
+        allowed_users_str += f"    {user}\n"
+allowed_users_str += "}"
+
+pattern = r'ALLOWED_USERS = \{[^}]*\}'
+content = re.sub(pattern, allowed_users_str, content, flags=re.DOTALL)
+
+# 写回文件
+with open('$APP', 'w', encoding='utf-8') as f:
+    f.write(content)
+
+print("✓ 配置已更新")
+PYSCRIPT
+
+echo "[9/11] 检查机器人代码..."
 "$VENV/bin/python" -m py_compile "$APP"
 echo "Python 语法检查：OK"
 
-echo "[9/10] 创建 systemd 保活服务..."
+echo "[10/11] 创建 systemd 保活服务..."
 cat > "$SERVICE" <<EOF
 [Unit]
 Description=Telegram Media Transfer Bot
@@ -130,23 +192,30 @@ EOF
 systemctl daemon-reload
 systemctl enable tg-media-bot
 
-echo "[10/10] 启动机器人..."
+echo "[11/11] 启动机器人..."
 systemctl restart tg-media-bot
 sleep 3
 
 echo
 echo "=========================================="
-echo " 部署完成"
+echo " 部署完成！"
 echo "=========================================="
+echo ""
+echo "📋 配置信息："
+echo "  安装目录: $APP_DIR"
+echo "  API_ID: $API_ID"
+echo "  API_HASH: ${API_HASH:0:16}..."
+echo "  BOT_TOKEN: ${BOT_TOKEN:0:20}..."
+echo "  授权账号: $ALLOWED_USERS_INPUT"
+echo "  目标群ID: $TARGET_CHAT_ID"
+echo "  缓存限制: ${MAX_CACHE_GB} GB"
+echo ""
+echo "🚀 常用命令："
+echo "  启动: systemctl start tg-media-bot"
+echo "  停止: systemctl stop tg-media-bot"
+echo "  重启: systemctl restart tg-media-bot"
+echo "  日志: journalctl -u tg-media-bot -f"
+echo "  状态: systemctl status tg-media-bot"
+echo ""
 
 systemctl --no-pager --full status tg-media-bot
-
-echo
-echo "运行程序：$APP"
-echo "Python 环境：$VENV"
-echo
-echo "实时日志："
-echo "journalctl -u tg-media-bot -f"
-echo
-echo "重启："
-echo "systemctl restart tg-media-bot"
