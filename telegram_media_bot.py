@@ -23,7 +23,7 @@ BOT_TOKEN = "PUT_YOUR_BOT_TOKEN_HERE"
 
 # 只允许这些 Telegram User ID 使用
 ALLOWED_USERS = {
-    123456789,
+    123456789
 }
 
 # 默认目标群；用户也可以用 /target 修改自己的目标群
@@ -1768,6 +1768,43 @@ async def _get_video_metadata(file_path):
         return 0, 1, 1
 
 
+async def _create_video_thumbnail(file_path):
+    """从视频第 1 帧生成 Telegram 视频缩略图。"""
+    file_path = Path(file_path)
+    thumb_path = file_path.with_name(f".{file_path.stem}.thumb.jpg")
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-i", str(file_path),
+            "-frames:v", "1",
+            "-vf", "scale='min(320,iw)':-2",
+            "-q:v", "5",
+            "-y", str(thumb_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+
+        if proc.returncode != 0 or not thumb_path.is_file() or thumb_path.stat().st_size <= 0:
+            detail = stderr.decode("utf-8", errors="replace").strip()[-1000:]
+            logging.warning(
+                "Video thumbnail generation failed: %s%s",
+                file_path,
+                f" | {detail}" if detail else "",
+            )
+            thumb_path.unlink(missing_ok=True)
+            return None
+
+        return thumb_path
+    except Exception:
+        logging.exception("Failed to generate video thumbnail: %s", file_path)
+        thumb_path.unlink(missing_ok=True)
+        return None
+
+
 async def send_album_from_handles(
     handles,
     files,
@@ -1802,32 +1839,45 @@ async def send_album_from_handles(
 
         elif suffix in (".mp4", ".m4v", ".mov", ".webm"):
             duration, width, height = await _get_video_metadata(path)
-            attributes = [
-                types.DocumentAttributeFilename(file_name=path.name),
-                types.DocumentAttributeVideo(
-                    duration=duration,
-                    w=width,
-                    h=height,
-                    supports_streaming=True,
-                ),
-            ]
-            uploaded = types.InputMediaUploadedDocument(
-                file=handle,
-                mime_type="video/mp4",
-                attributes=attributes,
-                force_file=False,
-                nosound_video=False,
-            )
-            uploaded_result = await client(
-                functions.messages.UploadMediaRequest(
-                    peer=entity,
-                    media=uploaded,
+
+            # Telegram 不会自动把视频第 1 帧当作我们通过 raw API 上传的缩略图。
+            # 这里显式生成 JPEG 缩略图并作为 thumb 上传，避免出现“能播放但封面空白”。
+            thumb_path = await _create_video_thumbnail(path)
+            thumb_handle = None
+            try:
+                if thumb_path:
+                    thumb_handle = await client.upload_file(str(thumb_path))
+
+                attributes = [
+                    types.DocumentAttributeFilename(file_name=path.name),
+                    types.DocumentAttributeVideo(
+                        duration=duration,
+                        w=width,
+                        h=height,
+                        supports_streaming=True,
+                    ),
+                ]
+                uploaded = types.InputMediaUploadedDocument(
+                    file=handle,
+                    thumb=thumb_handle,
+                    mime_type="video/mp4",
+                    attributes=attributes,
+                    force_file=False,
+                    nosound_video=False,
                 )
-            )
-            fm = utils.get_input_media(
-                uploaded_result.document,
-                supports_streaming=True,
-            )
+                uploaded_result = await client(
+                    functions.messages.UploadMediaRequest(
+                        peer=entity,
+                        media=uploaded,
+                    )
+                )
+                fm = utils.get_input_media(
+                    uploaded_result.document,
+                    supports_streaming=True,
+                )
+            finally:
+                if thumb_path:
+                    thumb_path.unlink(missing_ok=True)
 
         else:
             uploaded = types.InputMediaUploadedDocument(
