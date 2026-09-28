@@ -602,7 +602,7 @@ async def _resume_status_after_flood(message):
         STATUS_EDIT_RETRY_TASKS.pop(message_id, None)
 
 
-async def edit_status(message, text):
+async def edit_status(message, text, force=False):
     if not message:
         return
 
@@ -628,7 +628,7 @@ async def edit_status(message, text):
 
         # 正常状态更新：同一条消息至少间隔 3 秒。
         next_allowed = STATUS_EDIT_NEXT_ALLOWED.get(message_id, 0.0)
-        if now < next_allowed:
+        if not force and now < next_allowed:
             return
 
         try:
@@ -1615,6 +1615,10 @@ async def _parallel_big_upload(
             f"uploaded={uploaded_bytes}"
         )
 
+    # 所有分块成功后强制刷新到 100%，避免停在 97.x% 的旧进度。
+    uploaded_bytes = total_size
+    await update_progress(force=True)
+
     handle = types.InputFileBig(
         id=file_id,
         parts=total_parts,
@@ -2007,15 +2011,16 @@ async def send_album_from_handles(
         )
 
     if status_message:
-        try:
-            await edit_status(
+        # 最终状态不阻塞当前任务：发送成功后立即把控制权交还队列。
+        # Telegram 状态编辑在后台执行；如果遇到限流，edit_status 自己负责恢复。
+        asyncio.create_task(
+            edit_status(
                 status_message,
                 f"📦 媒体组发送完成\n"
-                f"{len(files)} 个媒体\n"
-                f"→ {target}"
+                f"{len(files)} 个媒体",
+                force=True,
             )
-        except Exception:
-            pass
+        )
 
 
 async def upload_media_group(
@@ -2486,7 +2491,8 @@ async def run_transfer(event, link, status_message=None, cache_dir=None):
                 caption=next((getattr(m, "message", None) for m in messages if getattr(m, "message", None)), None),
                 status_message=status_message,
             )
-            await edit_status(status_message, f"✅ 完成：{len(messages)} 个原始媒体已上传。\n媒体已发送完成。")
+            # send_album_from_handles 已经安排最终状态更新。
+            # 这里不再同步编辑，避免覆盖“📦 媒体组发送完成”并阻塞下一任务。
             return len(messages) > 0
 
         if not ensure_cache_room(
@@ -2525,14 +2531,8 @@ async def run_transfer(event, link, status_message=None, cache_dir=None):
             source_peer=peer,
         )
 
-        try:
-            await edit_status(status_message,
-                f"✅ 完成：{count} 个原始媒体已上传。\n"
-                f"媒体已发送完成。"
-            )
-        except Exception:
-            pass
-
+        # send_album_from_handles 已经安排最终状态更新。
+        # 不再等待额外的状态编辑，队列可以立即处理下一个任务。
         return True
 
     except asyncio.CancelledError:
