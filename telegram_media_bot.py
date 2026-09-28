@@ -23,7 +23,7 @@ BOT_TOKEN = "PUT_YOUR_BOT_TOKEN_HERE"
 
 # 只允许这些 Telegram User ID 使用
 ALLOWED_USERS = {
-    123456789
+    123456789,
 }
 
 # 默认目标群；用户也可以用 /target 修改自己的目标群
@@ -717,6 +717,70 @@ def is_video(path):
     }
 
 
+def is_telegram_video(message):
+    """根据 Telegram 消息本身判断是否为视频，不依赖下载后的文件后缀。"""
+    if getattr(message, "video", False):
+        return True
+
+    media_file = getattr(message, "file", None)
+    mime_type = getattr(media_file, "mime_type", None)
+    if isinstance(mime_type, str) and mime_type.lower().startswith("video/"):
+        return True
+
+    document = getattr(message, "document", None)
+    for attribute in getattr(document, "attributes", None) or []:
+        if isinstance(attribute, types.DocumentAttributeVideo):
+            return True
+
+    return False
+
+
+def ensure_video_extension(message, path):
+    """Telegram 判定为视频但下载结果没有扩展名时，只补 .mp4。"""
+    path = Path(path)
+    if not is_telegram_video(message):
+        return path
+    if path.suffix.lower() not in ("", ".bin"):
+        return path
+
+    new_path = path.with_suffix(".mp4")
+    if new_path.exists():
+        new_path.unlink()
+    path.rename(new_path)
+    return new_path
+
+
+async def ensure_video_extension_ffprobe(message, path):
+    """最后一道兜底：Telegram 明确是视频时，用 FFprobe 确认无扩展名/.bin 文件是否为视频。"""
+    path = Path(path)
+    if not path.is_file() or not is_telegram_video(message):
+        return path
+
+    if path.suffix.lower() not in ("", ".bin"):
+        return path
+
+    proc = await asyncio.create_subprocess_exec(
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=codec_type",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await proc.communicate()
+
+    if proc.returncode != 0 or stdout.decode("utf-8", errors="ignore").strip() != "video":
+        return path
+
+    new_path = path.with_suffix(".mp4")
+    if new_path.exists():
+        new_path.unlink()
+    path.rename(new_path)
+    return new_path
+
+
 async def split_video_ffmpeg(path, output_dir, status_message=None, file_index=1, file_total=1):
     """使用 FFmpeg stream copy 切片，并实时报告切片进度。"""
     path = Path(path)
@@ -918,10 +982,15 @@ async def download_message_parallel(
             file=str(task_dir),
             progress_callback=progress,
         )
-        return Path(path) if path else None
+        return await ensure_video_extension_ffprobe(
+            message,
+            ensure_video_extension(message, path)
+        ) if path else None
 
     chunk_size = DOWNLOAD_CHUNK_SIZE
     output_name = getattr(media_file, "name", None) or f"media_{getattr(message, 'id', index)}"
+    if is_telegram_video(message) and Path(output_name).suffix.lower() in ("", ".bin"):
+        output_name = f"{Path(output_name).stem}.mp4"
     output_path = Path(task_dir) / output_name
     parts_dir = Path(task_dir) / f".parts_{getattr(message, 'id', index)}"
     parts_dir.mkdir(parents=True, exist_ok=True)
@@ -1205,6 +1274,10 @@ async def download_message_parallel(
             format_bytes(best_speed),
         )
 
+        output_path = await ensure_video_extension_ffprobe(
+            message,
+            ensure_video_extension(message, output_path)
+        )
         return output_path
 
     except asyncio.CancelledError:
@@ -1768,40 +1841,31 @@ async def _get_video_metadata(file_path):
         return 0, 1, 1
 
 
-async def _create_video_thumbnail(file_path):
-    """从视频第 1 帧生成 Telegram 视频缩略图。"""
+async def _generate_video_thumbnail(file_path):
+    """从视频首帧生成 Telegram 视频缩略图。"""
     file_path = Path(file_path)
-    thumb_path = file_path.with_name(f".{file_path.stem}.thumb.jpg")
-
+    thumb_path = file_path.with_name(f"{file_path.stem}.thumb.jpg")
     try:
         proc = await asyncio.create_subprocess_exec(
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel", "error",
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
             "-i", str(file_path),
             "-frames:v", "1",
-            "-vf", "scale='min(320,iw)':-2",
-            "-q:v", "5",
-            "-y", str(thumb_path),
+            "-vf", "scale=320:320:force_original_aspect_ratio=decrease",
+            "-q:v", "3",
+            str(thumb_path),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         _, stderr = await proc.communicate()
-
-        if proc.returncode != 0 or not thumb_path.is_file() or thumb_path.stat().st_size <= 0:
-            detail = stderr.decode("utf-8", errors="replace").strip()[-1000:]
+        if proc.returncode != 0 or not thumb_path.exists() or thumb_path.stat().st_size == 0:
             logging.warning(
-                "Video thumbnail generation failed: %s%s",
-                file_path,
-                f" | {detail}" if detail else "",
+                "Failed to generate video thumbnail: %s",
+                stderr.decode("utf-8", errors="ignore").strip(),
             )
-            thumb_path.unlink(missing_ok=True)
             return None
-
         return thumb_path
     except Exception:
         logging.exception("Failed to generate video thumbnail: %s", file_path)
-        thumb_path.unlink(missing_ok=True)
         return None
 
 
@@ -1839,24 +1903,20 @@ async def send_album_from_handles(
 
         elif suffix in (".mp4", ".m4v", ".mov", ".webm"):
             duration, width, height = await _get_video_metadata(path)
-
-            # Telegram 不会自动把视频第 1 帧当作我们通过 raw API 上传的缩略图。
-            # 这里显式生成 JPEG 缩略图并作为 thumb 上传，避免出现“能播放但封面空白”。
-            thumb_path = await _create_video_thumbnail(path)
+            attributes = [
+                types.DocumentAttributeFilename(file_name=path.name),
+                types.DocumentAttributeVideo(
+                    duration=duration,
+                    w=width,
+                    h=height,
+                    supports_streaming=True,
+                ),
+            ]
+            thumb_path = await _generate_video_thumbnail(path)
             thumb_handle = None
             try:
                 if thumb_path:
                     thumb_handle = await client.upload_file(str(thumb_path))
-
-                attributes = [
-                    types.DocumentAttributeFilename(file_name=path.name),
-                    types.DocumentAttributeVideo(
-                        duration=duration,
-                        w=width,
-                        h=height,
-                        supports_streaming=True,
-                    ),
-                ]
                 uploaded = types.InputMediaUploadedDocument(
                     file=handle,
                     thumb=thumb_handle,
@@ -1871,13 +1931,16 @@ async def send_album_from_handles(
                         media=uploaded,
                     )
                 )
-                fm = utils.get_input_media(
-                    uploaded_result.document,
-                    supports_streaming=True,
-                )
             finally:
                 if thumb_path:
-                    thumb_path.unlink(missing_ok=True)
+                    try:
+                        thumb_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+            fm = utils.get_input_media(
+                uploaded_result.document,
+                supports_streaming=True,
+            )
 
         else:
             uploaded = types.InputMediaUploadedDocument(
