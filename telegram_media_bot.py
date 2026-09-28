@@ -969,7 +969,7 @@ async def download_message_parallel(
                 await edit_status(
                     status_message,
                     f"📥 下载 {index}/{total_files}\n\n"
-                    f"{icon} 文件\n"
+                    f"{icon} 文件（单路下载）\n"
                     f"{progress_bar(percent)} {percent:5.1f}%\n"
                     f"{format_bytes(current)} / {format_bytes(total)}\n"
                     f"速度：{format_bytes(speed)}/s\n"
@@ -1005,12 +1005,12 @@ async def download_message_parallel(
     offset = 0
     progress_lock = asyncio.Lock()
 
-    async def update_status():
+    async def update_status(force=False):
         nonlocal last_update
         if not status_message:
             return
         now = time.monotonic()
-        if downloaded < total_size and now - last_update < 1.0:
+        if not force and downloaded < total_size and now - last_update < 1.0:
             return
 
         elapsed = max(now - started, 0.001)
@@ -1036,6 +1036,8 @@ async def download_message_parallel(
             )
         except Exception:
             pass
+
+    await update_status(force=True)
 
     async def download_range(part_no, start_offset, end_offset, batch_received):
         nonlocal downloaded
@@ -1199,6 +1201,8 @@ async def download_message_parallel(
                 total_size,
             )
 
+            connections_changed = False
+
             if batch_speed > 0:
                 if best_speed <= 0:
                     best_speed = batch_speed
@@ -1214,6 +1218,7 @@ async def download_message_parallel(
                                 DOWNLOAD_CONNECTIONS_MAX,
                                 connections + DOWNLOAD_CONNECTIONS_STEP,
                             )
+                            connections_changed = True
                             logging.info(
                                 "Batch speed check: %.2f MB/s; increasing connections to %s",
                                 batch_speed / 1024 / 1024,
@@ -1225,6 +1230,7 @@ async def download_message_parallel(
                                 DOWNLOAD_CONNECTIONS_MIN,
                                 connections - DOWNLOAD_CONNECTIONS_STEP,
                             )
+                            connections_changed = True
                             logging.info(
                                 "Batch speed check: %.2f MB/s; reducing connections to %s",
                                 batch_speed / 1024 / 1024,
@@ -1234,7 +1240,7 @@ async def download_message_parallel(
                     last_adjust_speed = batch_speed
                     best_speed = max(best_speed, batch_speed)
 
-        await update_status()
+            await update_status(force=connections_changed)
 
         # 严格按照 part_no / offset 顺序合并。
         all_parts.sort(key=lambda x: int(x.stem.split("_")[-1]))
@@ -1387,6 +1393,8 @@ async def _parallel_big_upload(
                 f"并行：{connections} 路（自动调速）"
             )
             last_progress[0] = now
+
+    await update_progress(force=True)
 
     async def upload_part(part_no):
         nonlocal uploaded_bytes
@@ -1730,7 +1738,8 @@ async def upload_file_with_retry(
                 f"{progress_bar(percent)} {percent:5.1f}%\n"
                 f"{format_bytes(current)} / {format_bytes(total)}\n"
                 f"速度：{format_bytes(speed)}/s\n"
-                f"预计剩余：{eta_text}"
+                f"预计剩余：{eta_text}\n"
+                f"并行：单路（小文件）"
                 f"{retry_text}"
             )
 
