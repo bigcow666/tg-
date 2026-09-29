@@ -3,12 +3,16 @@ import fcntl
 from dataclasses import dataclass, field
 import json
 import logging
+import os
 import re
 import shutil
 import secrets
 import subprocess
 import time
+import uuid
+from contextvars import ContextVar
 from pathlib import Path
+from types import SimpleNamespace
 
 from telethon import TelegramClient, events, functions, types, utils
 from telethon.sessions import MemorySession
@@ -140,6 +144,10 @@ client = TelegramClient(
 # ============================================================
 USERS = {}
 
+class RetryableTransferError(Exception):
+    """Telegram/network interruption: keep the job queued for retry instead of marking it failed."""
+
+
 @dataclass
 class TransferJob:
     job_id: str
@@ -158,8 +166,199 @@ JOBS = {}
 USER_JOBS = {}
 QUEUE_WORKERS = []
 
+# ============================================================
+# 持久化任务队列 / 唯一总状态消息
+# ============================================================
+TASKS_DIR = Path("./tasks")
+TASKS_FILE = TASKS_DIR / "queue.json"
+STATUS_STATE_FILE = TASKS_DIR / "status.json"
+
+# 当前只有这一条总状态消息；新链接到来时旧消息删除，新的状态消息移动到最下面。
+GLOBAL_STATUS_MESSAGE = None
+GLOBAL_STATUS_CHAT_ID = None
+GLOBAL_STATUS_MESSAGE_ID = None
+GLOBAL_LAST_USER_MESSAGE_ID = None
+
+# 当前这批任务的统计。任务完成后从 JOBS 移除，但统计仍保留。
+BATCH_TOTAL = 0
+BATCH_COMPLETED = 0
+BATCH_FAILED = 0
+BATCH_CANCELLED = 0
+JOB_STATUS_TEXTS = {}
+CURRENT_JOB_ID = ContextVar("current_job_id", default=None)
+PERSISTENCE_LOCK = asyncio.Lock()
+
+
+def ensure_task_dirs():
+    TASKS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def atomic_write_json(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    try:
+        tmp.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def serialize_job(job):
+    return {
+        "job_id": job.job_id,
+        "user_id": int(job.user_id),
+        "link": job.link,
+        "created_at": float(job.created_at),
+        "status": job.status,
+        "cache_dir": job.cache_dir,
+        "cancelled": bool(job.cancelled),
+    }
+
+
+def save_persistent_queue():
+    jobs = []
+    for job in JOBS.values():
+        if job.status in ("排队中", "运行中") and not job.cancelled:
+            jobs.append(serialize_job(job))
+
+    data = {
+        "version": 1,
+        "jobs": jobs,
+        "batch": {
+            "total": BATCH_TOTAL,
+            "completed": BATCH_COMPLETED,
+            "failed": BATCH_FAILED,
+            "cancelled": BATCH_CANCELLED,
+        },
+        "status": {
+            "chat_id": GLOBAL_STATUS_CHAT_ID,
+            "message_id": GLOBAL_STATUS_MESSAGE_ID,
+            "last_user_message_id": GLOBAL_LAST_USER_MESSAGE_ID,
+        },
+    }
+    atomic_write_json(TASKS_FILE, data)
+
+
+def load_persistent_queue():
+    global BATCH_TOTAL, BATCH_COMPLETED, BATCH_FAILED, BATCH_CANCELLED
+    global GLOBAL_STATUS_CHAT_ID, GLOBAL_STATUS_MESSAGE_ID, GLOBAL_LAST_USER_MESSAGE_ID
+
+    if not TASKS_FILE.exists():
+        return []
+
+    try:
+        data = json.loads(TASKS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        logging.exception("Failed to load persistent task queue.")
+        return []
+
+    batch = data.get("batch") or {}
+    BATCH_TOTAL = int(batch.get("total", 0) or 0)
+    BATCH_COMPLETED = int(batch.get("completed", 0) or 0)
+    BATCH_FAILED = int(batch.get("failed", 0) or 0)
+    BATCH_CANCELLED = int(batch.get("cancelled", 0) or 0)
+
+    status = data.get("status") or {}
+    GLOBAL_STATUS_CHAT_ID = status.get("chat_id")
+    GLOBAL_STATUS_MESSAGE_ID = status.get("message_id")
+    GLOBAL_LAST_USER_MESSAGE_ID = status.get("last_user_message_id")
+
+    restored = []
+    seen_job_ids = set()
+    for item in data.get("jobs", []):
+        try:
+            # 进程重启后，之前“运行中”的任务统一退回队列。
+            # 原下载半成品不会被当成完整缓存；run_transfer 会重新检查 ready=True 缓存。
+            status = item.get("status", "排队中")
+            if status not in ("排队中", "运行中"):
+                continue
+            job_id = str(item["job_id"])
+            if not job_id or job_id in seen_job_ids:
+                continue
+            link = str(item["link"]).strip()
+            if not parse_message_link(link):
+                logging.warning("Skipping invalid persisted job link: %s", link)
+                continue
+            seen_job_ids.add(job_id)
+            job = TransferJob(
+                job_id=job_id,
+                user_id=int(item["user_id"]),
+                link=link,
+                event=SimpleNamespace(sender_id=int(item["user_id"])),
+                created_at=float(item.get("created_at", time.time())),
+                status="排队中",
+                cache_dir=item.get("cache_dir"),
+                cancelled=False,
+            )
+            restored.append(job)
+        except Exception:
+            logging.exception("Failed to restore one persistent job: %s", item)
+
+    return restored
+
+
+def rebuild_job_indexes(jobs):
+    JOBS.clear()
+    USER_JOBS.clear()
+    JOB_STATUS_TEXTS.clear()
+    for job in jobs:
+        JOBS[job.job_id] = job
+        USER_JOBS.setdefault(job.user_id, []).append(job.job_id)
+
+
+def active_job_count():
+    return sum(
+        1 for job in JOBS.values()
+        if job.status in ("运行中", "排队中") and not job.cancelled
+    )
+
+
+def queue_status_text():
+    running = sum(1 for job in JOBS.values() if job.status == "运行中")
+    queued = sum(1 for job in JOBS.values() if job.status == "排队中" and not job.cancelled)
+
+    lines = [
+        "📋 转存任务",
+        "━━━━━━━━━━━━",
+        f"总任务：{BATCH_TOTAL}",
+        f"完成：{BATCH_COMPLETED}",
+        f"运行中：{running}",
+        f"排队：{queued}",
+    ]
+    if BATCH_FAILED:
+        lines.append(f"失败：{BATCH_FAILED}")
+    if BATCH_CANCELLED:
+        lines.append(f"取消：{BATCH_CANCELLED}")
+
+    running_jobs = [job for job in JOBS.values() if job.status == "运行中"]
+    for job in running_jobs[:MAX_CONCURRENT_TASKS]:
+        detail = JOB_STATUS_TEXTS.get(job.job_id)
+        if detail:
+            detail = detail.strip()
+            if len(detail) > 500:
+                detail = detail[:497] + "..."
+            lines.extend(["", f"▶️ [{job.job_id[:8]}]", detail])
+        else:
+            link = job.link.strip().replace("\n", " ")
+            if len(link) > 120:
+                link = link[:117] + "..."
+            lines.extend(["", f"▶️ [{job.job_id[:8]}] {link}"])
+
+    if queued:
+        lines.extend(["", f"⏳ 还有 {queued} 个任务排队中"])
+
+    return "\n".join(lines)
+
 def ensure_dirs():
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_task_dirs()
     if not CONFIG_FILE.exists():
         CONFIG_FILE.write_text("{}", encoding="utf-8")
 
@@ -522,7 +721,7 @@ async def get_album_messages(peer, linked_message):
 STATUS_LOCKS = {}
 
 # Telegram 状态消息编辑限速：同一条消息默认至少间隔 3 秒。
-STATUS_EDIT_MIN_INTERVAL = 3.0
+STATUS_EDIT_MIN_INTERVAL = 5.0
 STATUS_EDIT_NEXT_ALLOWED = {}
 STATUS_EDIT_FLOOD_UNTIL = {}
 STATUS_EDIT_LAST_TEXT = {}
@@ -599,10 +798,17 @@ async def _resume_status_after_flood(message):
             message_id,
         )
     finally:
-        STATUS_EDIT_RETRY_TASKS.pop(message_id, None)
+        current = asyncio.current_task()
+        if STATUS_EDIT_RETRY_TASKS.get(message_id) is current:
+            STATUS_EDIT_RETRY_TASKS.pop(message_id, None)
 
 
 async def edit_status(message, text, force=False):
+    global GLOBAL_STATUS_MESSAGE
+
+    if GLOBAL_STATUS_MESSAGE is not None:
+        message = GLOBAL_STATUS_MESSAGE
+
     if not message:
         return
 
@@ -610,15 +816,16 @@ async def edit_status(message, text, force=False):
     if message_id is None:
         return
 
-    # 永远保存最新状态。即使 Telegram 暂时不允许编辑，
-    # FloodWait 结束后也能自动补上最新状态。
-    STATUS_EDIT_LAST_TEXT[message_id] = text
+    job_id = CURRENT_JOB_ID.get()
+    if job_id:
+        JOB_STATUS_TEXTS[job_id] = text
+
+    rendered = queue_status_text() if GLOBAL_STATUS_MESSAGE is not None else text
+    STATUS_EDIT_LAST_TEXT[message_id] = rendered
 
     lock = get_status_lock(message_id)
     async with lock:
         now = time.monotonic()
-
-        # FloodWait 期间不再发送 EditMessageRequest。
         flood_until = STATUS_EDIT_FLOOD_UNTIL.get(message_id, 0.0)
         if now < flood_until:
             if message_id not in STATUS_EDIT_RETRY_TASKS:
@@ -626,45 +833,96 @@ async def edit_status(message, text, force=False):
                 STATUS_EDIT_RETRY_TASKS[message_id] = task
             return
 
-        # 正常状态更新：同一条消息至少间隔 3 秒。
         next_allowed = STATUS_EDIT_NEXT_ALLOWED.get(message_id, 0.0)
         if not force and now < next_allowed:
             return
 
         try:
-            await message.edit(text)
-            STATUS_EDIT_NEXT_ALLOWED[message_id] = (
-                time.monotonic() + STATUS_EDIT_MIN_INTERVAL
-            )
+            await message.edit(rendered)
+            STATUS_EDIT_NEXT_ALLOWED[message_id] = time.monotonic() + STATUS_EDIT_MIN_INTERVAL
         except Exception as e:
             wait_seconds = getattr(e, "seconds", None)
             if type(e).__name__ == "FloodWaitError" and wait_seconds is not None:
-                # 额外留 1 秒缓冲。
                 until = time.monotonic() + float(wait_seconds) + 1.0
                 STATUS_EDIT_FLOOD_UNTIL[message_id] = until
                 STATUS_EDIT_NEXT_ALLOWED[message_id] = until
-
-                # 只创建一个恢复任务，绝不每秒重复请求 Telegram。
                 if message_id not in STATUS_EDIT_RETRY_TASKS:
                     task = asyncio.create_task(_resume_status_after_flood(message))
                     STATUS_EDIT_RETRY_TASKS[message_id] = task
-
                 logging.warning(
-                    "Status message edit rate-limited: message_id=%s wait=%ss; "
-                    "automatic recovery scheduled; transfer continues.",
-                    message_id,
-                    wait_seconds,
+                    "Status message edit rate-limited: message_id=%s wait=%ss; automatic recovery scheduled; transfer continues.",
+                    message_id, wait_seconds,
                 )
             else:
                 logging.warning(
                     "Status message edit failed: message_id=%s error=%s: %s",
-                    message_id,
-                    type(e).__name__,
-                    e,
+                    message_id, type(e).__name__, e,
                 )
 
 def release_status_lock(message_id):
     STATUS_LOCKS.pop(message_id, None)
+
+
+async def cleanup_status_message_state(message_id):
+    if not message_id:
+        return
+    retry = STATUS_EDIT_RETRY_TASKS.pop(message_id, None)
+    if retry and retry is not asyncio.current_task() and not retry.done():
+        retry.cancel()
+    STATUS_EDIT_FLOOD_UNTIL.pop(message_id, None)
+    STATUS_EDIT_NEXT_ALLOWED.pop(message_id, None)
+    STATUS_EDIT_LAST_TEXT.pop(message_id, None)
+    STATUS_LOCKS.pop(message_id, None)
+
+
+async def create_or_move_global_status(event=None, force_new=False):
+    """保证全局只有一条总状态；新链接到来时把它移动到最新链接下面。"""
+    global GLOBAL_STATUS_MESSAGE, GLOBAL_STATUS_CHAT_ID, GLOBAL_STATUS_MESSAGE_ID
+    global GLOBAL_LAST_USER_MESSAGE_ID
+
+    if event is not None:
+        GLOBAL_LAST_USER_MESSAGE_ID = getattr(event, "id", None)
+        GLOBAL_STATUS_CHAT_ID = int(event.chat_id or event.sender_id)
+
+    old = GLOBAL_STATUS_MESSAGE
+    if old is not None and force_new:
+        old_id = getattr(old, "id", None)
+        try:
+            await old.delete()
+        except Exception as e:
+            logging.info("Old global status delete skipped: %s", e)
+        await cleanup_status_message_state(old_id)
+        GLOBAL_STATUS_MESSAGE = None
+        GLOBAL_STATUS_MESSAGE_ID = None
+
+    if GLOBAL_STATUS_MESSAGE is None and GLOBAL_STATUS_CHAT_ID and GLOBAL_STATUS_MESSAGE_ID:
+        try:
+            GLOBAL_STATUS_MESSAGE = await client.get_messages(
+                GLOBAL_STATUS_CHAT_ID, ids=int(GLOBAL_STATUS_MESSAGE_ID)
+            )
+            if isinstance(GLOBAL_STATUS_MESSAGE, list):
+                GLOBAL_STATUS_MESSAGE = GLOBAL_STATUS_MESSAGE[0] if GLOBAL_STATUS_MESSAGE else None
+        except Exception:
+            GLOBAL_STATUS_MESSAGE = None
+
+    if GLOBAL_STATUS_MESSAGE is None and GLOBAL_STATUS_CHAT_ID:
+        reply_to = GLOBAL_LAST_USER_MESSAGE_ID if GLOBAL_LAST_USER_MESSAGE_ID else None
+        GLOBAL_STATUS_MESSAGE = await client.send_message(
+            GLOBAL_STATUS_CHAT_ID,
+            queue_status_text(),
+            reply_to=reply_to,
+        )
+        GLOBAL_STATUS_MESSAGE_ID = GLOBAL_STATUS_MESSAGE.id
+
+    save_persistent_queue()
+    return GLOBAL_STATUS_MESSAGE
+
+
+async def refresh_global_status(force=False):
+    if GLOBAL_STATUS_MESSAGE is None:
+        return
+    await edit_status(GLOBAL_STATUS_MESSAGE, queue_status_text(), force=force)
+    save_persistent_queue()
 
 
 def format_bytes(value):
@@ -923,6 +1181,30 @@ async def split_video_ffmpeg(path, output_dir, status_message=None, file_index=1
     return parts
 
 
+def get_display_name(message, fallback=None):
+    """状态显示：优先实际文件名，其次 Telegram 媒体文件名/标题/Caption，最后兜底。"""
+    media_file = getattr(message, "file", None)
+    name = getattr(media_file, "name", None) if media_file else None
+    if name:
+        return Path(str(name)).name
+
+    document = getattr(message, "document", None)
+    if document:
+        for attr in getattr(document, "attributes", None) or []:
+            name = getattr(attr, "file_name", None)
+            if name:
+                return Path(str(name)).name
+
+    caption = getattr(message, "message", None) or getattr(message, "text", None)
+    if caption:
+        caption = " ".join(str(caption).split())
+        if len(caption) > 80:
+            caption = caption[:77] + "..."
+        return caption
+
+    return fallback or f"媒体_{getattr(message, 'id', 'unknown')}"
+
+
 async def download_message_parallel(
     message,
     task_dir,
@@ -969,7 +1251,7 @@ async def download_message_parallel(
                 await edit_status(
                     status_message,
                     f"📥 下载 {index}/{total_files}\n\n"
-                    f"{icon} 文件（单路下载）\n"
+                    f"{icon} {get_display_name(message)}\n"
                     f"{progress_bar(percent)} {percent:5.1f}%\n"
                     f"{format_bytes(current)} / {format_bytes(total)}\n"
                     f"速度：{format_bytes(speed)}/s\n"
@@ -1028,7 +1310,7 @@ async def download_message_parallel(
             await edit_status(
                 status_message,
                 f"📥 下载 {index}/{total_files}\n\n"
-                f"🎬 文件（{connections} 路并行，自动调速）\n"
+                f"🎬 {Path(output_name).name}\n"
                 f"{progress_bar(percent)} {percent:5.1f}%\n"
                 f"{format_bytes(downloaded)} / {format_bytes(total_size)}\n"
                 f"速度：{format_bytes(speed)}/s\n"
@@ -2184,6 +2466,7 @@ async def start_handler(event):
         "/queue - 查看队列\n"
         "/cancel - 取消当前任务\n"
         "/cancelall - 取消你的全部任务\n"
+        "/clearqueue - 清空任务队列（不删缓存）\n"
         "/clearcache - 手动清理缓存\n\n"
         "链接格式：\n"
         "https://t.me/channel/123\n"
@@ -2317,6 +2600,17 @@ async def cancel_handler(event):
 
         job.cancelled = True
         job.status = "已取消"
+        release_cache_reservation(job.cache_dir)
+        JOBS.pop(job.job_id, None)
+        user_list = USER_JOBS.get(event.sender_id, [])
+        if job.job_id in user_list:
+            user_list.remove(job.job_id)
+        if not user_list:
+            USER_JOBS.pop(event.sender_id, None)
+        global BATCH_CANCELLED
+        BATCH_CANCELLED += 1
+        save_persistent_queue()
+        await refresh_global_status(force=True)
 
         await event.reply(
             f"🛑 已取消排队任务 [{job.job_id[:8]}]"
@@ -2355,6 +2649,9 @@ async def cancelall_handler(event):
 
     total = cancelled_running + cancelled_queued
 
+    save_persistent_queue()
+    await refresh_global_status(force=True)
+
     if total:
         await event.reply(
             f"🛑 已取消全部任务：{total} 个\n"
@@ -2364,6 +2661,43 @@ async def cancelall_handler(event):
         )
     else:
         await event.reply("你当前没有运行中或排队中的任务。")
+
+
+@client.on(events.NewMessage(pattern=r"^/clearqueue$"))
+async def clearqueue_handler(event):
+    if not is_allowed(event.sender_id):
+        await event.reply("你没有权限使用此 Bot。")
+        return
+
+    running_tasks = []
+    for job in list(JOBS.values()):
+        job.cancelled = True
+        if job.task and not job.task.done():
+            job.task.cancel()
+            running_tasks.append(job.task)
+        release_cache_reservation(job.cache_dir)
+
+    # 先等待正在运行的传输任务真正退出，再清空内存和持久化队列，
+    # 避免 worker 在清空之后又把“取消”状态写回 queue.json。
+    if running_tasks:
+        await asyncio.gather(*running_tasks, return_exceptions=True)
+
+    JOBS.clear()
+    USER_JOBS.clear()
+    JOB_STATUS_TEXTS.clear()
+
+    while not JOB_QUEUE.empty():
+        try:
+            JOB_QUEUE.get_nowait()
+            JOB_QUEUE.task_done()
+        except asyncio.QueueEmpty:
+            break
+
+    global BATCH_TOTAL, BATCH_COMPLETED, BATCH_FAILED, BATCH_CANCELLED
+    BATCH_TOTAL = BATCH_COMPLETED = BATCH_FAILED = BATCH_CANCELLED = 0
+    save_persistent_queue()
+    await refresh_global_status(force=True)
+    await event.reply("🧹 任务队列已全部清空。\n缓存不会删除。")
 
 
 @client.on(events.NewMessage(pattern=r"^/clearcache$"))
@@ -2425,11 +2759,7 @@ async def run_transfer(event, link, status_message=None, cache_dir=None):
     try:
         # 保留原来的状态流程：队列消息进入 worker 后，立即切换到
         # “正在读取链接消息”，后面的找到媒体/下载/切片/上传进度继续编辑同一条。
-        if status_message is None:
-            status_message = await event.reply(
-                "🔎 正在读取链接消息..."
-            )
-        else:
+        if status_message is not None:
             await edit_status(
                 status_message,
                 "🔎 正在读取链接消息..."
@@ -2536,9 +2866,18 @@ async def run_transfer(event, link, status_message=None, cache_dir=None):
         return True
 
     except asyncio.CancelledError:
-        if status_message:
-            await edit_status(status_message, "🛑 任务已取消\n已完成的缓存保留，可用于后续复用。\n未完成的缓存已清理。")
-        return False
+        # 不把任务取消转换成 False。
+        # worker 会区分用户 /cancel 与机器人关闭/重启。
+        raise
+
+    except (ConnectionError, asyncio.TimeoutError) as e:
+        # Telegram 连接断开/请求超时：不计入最终失败，交给 worker 重新排队。
+        logging.warning(
+            "Telegram/network interruption; keeping job for retry: %s: %s",
+            type(e).__name__,
+            e,
+        )
+        raise RetryableTransferError(str(e)) from e
 
     except FloodWaitError as e:
         await edit_status(
@@ -2577,55 +2916,66 @@ async def run_transfer(event, link, status_message=None, cache_dir=None):
             logging.exception("Failed to clean incomplete cache: %s", task_dir)
             safe_remove(task_dir)
 
-        if 'status_message' in locals() and status_message:
-            release_status_lock(status_message.id)
+        # 不清理全局总状态消息的状态锁；后台任务结束后仍可能有其他任务继续更新同一条消息。
 
 
 @client.on(events.NewMessage)
 async def link_handler(event):
+    global BATCH_TOTAL, BATCH_COMPLETED, BATCH_FAILED, BATCH_CANCELLED
+    global GLOBAL_STATUS_MESSAGE, GLOBAL_STATUS_CHAT_ID, GLOBAL_STATUS_MESSAGE_ID, GLOBAL_LAST_USER_MESSAGE_ID
+
     if not is_allowed(event.sender_id):
         return
-
-    # 命令交给对应 handler
     if event.raw_text.startswith("/"):
         return
 
-    parsed = parse_message_link(event.raw_text)
-    if not parsed:
+    # 一条消息中允许粘贴任意多个 Telegram 链接。
+    links = []
+    seen = set()
+    for match in TG_LINK_RE.finditer(event.raw_text):
+        link_text = match.group(0)
+        parsed = parse_message_link(link_text)
+        if not parsed:
+            continue
+        normalized = link_text.strip()
+        if normalized not in seen:
+            seen.add(normalized)
+            links.append((normalized, parsed))
+
+    if not links:
         return
 
-    # 每一个链接都创建独立任务并进入全局 FIFO 队列。
-    # 不再限制同一个用户只能有一个任务。
-    import uuid
+    # 如果上一批已经全部结束，新来的链接开启新的一批统计。
+    if active_job_count() == 0:
+        BATCH_TOTAL = BATCH_COMPLETED = BATCH_FAILED = BATCH_CANCELLED = 0
+        JOB_STATUS_TEXTS.clear()
 
-    job_id = uuid.uuid4().hex
-    link_text = event.raw_text.strip()
-    peer, message_id = parsed
-    cached_dir = note_new_cache_task(peer, message_id)
+    GLOBAL_LAST_USER_MESSAGE_ID = event.id
+    GLOBAL_STATUS_CHAT_ID = int(event.chat_id or event.sender_id)
 
-    job = TransferJob(
-        job_id=job_id,
-        user_id=event.sender_id,
-        link=link_text,
-        event=event,
-        cache_dir=str(cached_dir) if cached_dir else None,
-    )
-    if cached_dir:
-        reserve_cache(cached_dir)
+    # 状态消息永远移动到“最新链接”下面。
+    await create_or_move_global_status(event, force_new=True)
 
-    JOBS[job_id] = job
-    USER_JOBS.setdefault(event.sender_id, []).append(job_id)
+    for link_text, (peer, message_id) in links:
+        job_id = uuid.uuid4().hex
+        cached_dir = note_new_cache_task(peer, message_id)
+        job = TransferJob(
+            job_id=job_id,
+            user_id=event.sender_id,
+            link=link_text,
+            event=event,
+            cache_dir=str(cached_dir) if cached_dir else None,
+        )
+        if cached_dir:
+            reserve_cache(cached_dir)
 
-    position = JOB_QUEUE.qsize() + 1
+        JOBS[job_id] = job
+        USER_JOBS.setdefault(event.sender_id, []).append(job_id)
+        BATCH_TOTAL += 1
+        await JOB_QUEUE.put(job)
 
-    # 每个转存任务只创建这一条状态消息；后续全部 edit，不再额外发送进度消息。
-    job.status_message = await event.reply(
-        f"📥 已加入转存队列 [{job_id[:8]}]\n"
-        f"队列等待：约第 {position} 个\n"
-        f"并发上限：{MAX_CONCURRENT_TASKS}"
-    )
-
-    await JOB_QUEUE.put(job)
+    save_persistent_queue()
+    await refresh_global_status(force=True)
 
 
 async def transfer_worker(worker_id):
@@ -2633,81 +2983,106 @@ async def transfer_worker(worker_id):
 
     while True:
         job = await JOB_QUEUE.get()
-
         try:
             if job.cancelled or job.status == "已取消":
                 release_cache_reservation(job.cache_dir)
-                logging.info(
-                    "Queue worker %s skipped cancelled job=%s",
-                    worker_id,
-                    job.job_id,
-                )
+                JOBS.pop(job.job_id, None)
+                save_persistent_queue()
                 continue
 
             job.status = "运行中"
-            RUNNING = sum(
-                1 for item in JOBS.values()
-                if item.status == "运行中"
-            )
+            save_persistent_queue()
+            await refresh_global_status(force=True)
 
             logging.info(
                 "Queue worker %s starting job=%s user=%s running=%s/%s",
-                worker_id,
-                job.job_id,
-                job.user_id,
-                RUNNING,
+                worker_id, job.job_id, job.user_id,
+                sum(1 for item in JOBS.values() if item.status == "运行中"),
                 MAX_CONCURRENT_TASKS,
             )
 
-            job.task = asyncio.create_task(
-                run_transfer(job.event, job.link, job.status_message, job.cache_dir)
-            )
+            # 永远取当前唯一总状态消息，而不是任务创建时的旧消息。
+            job.status_message = GLOBAL_STATUS_MESSAGE
+            token = CURRENT_JOB_ID.set(job.job_id)
+            try:
+                job.task = asyncio.create_task(
+                    run_transfer(job.event, job.link, GLOBAL_STATUS_MESSAGE, job.cache_dir)
+                )
+            finally:
+                CURRENT_JOB_ID.reset(token)
 
             result = False
+            interrupted = False
+            retryable = False
             try:
                 result = await job.task
+            except RetryableTransferError as e:
+                # 网络/Telegram 连接问题：保留任务，不计失败。
+                retryable = True
+                job.status = "排队中"
+                logging.warning(
+                    "Job kept for retry after Telegram/network interruption: %s (%s)",
+                    job.job_id,
+                    e,
+                )
             except asyncio.CancelledError:
-                # /cancel 取消的是 transfer task，不取消 worker 自己。
-                logging.info(
-                    "Job cancelled: %s",
+                # systemd restart、机器人关闭或进程退出时：
+                # 不把当前任务转换成“失败”。保持运行中并持久化，
+                # 下一次启动会自动恢复为排队中。
+                interrupted = True
+                logging.warning(
+                    "Job interrupted by bot shutdown/restart; preserving: %s",
                     job.job_id,
                 )
             except Exception:
-                logging.exception(
-                    "Unhandled job exception: %s",
-                    job.job_id,
-                )
+                logging.exception("Unhandled job exception: %s", job.job_id)
 
+            global BATCH_COMPLETED, BATCH_FAILED, BATCH_CANCELLED
             if job.cancelled:
                 job.status = "已取消"
+                BATCH_CANCELLED += 1
+            elif interrupted:
+                job.status = "运行中"
+            elif retryable:
+                job.status = "排队中"
             elif result is True:
                 job.status = "已完成"
+                BATCH_COMPLETED += 1
             else:
                 job.status = "失败"
+                BATCH_FAILED += 1
                 logging.error("Job failed: %s", job.job_id)
 
         finally:
             job.task = None
             JOB_QUEUE.task_done()
+            release_cache_reservation(job.cache_dir)
 
-            # 已结束任务从活动任务表删除；用户队列列表也同步清理。
+            # 只有真正完成/失败/主动取消的任务才从活动队列删除。
+            # 运行中/排队中必须保留在 queue.json。
             if job.status in ("已完成", "已取消", "失败"):
+                JOB_STATUS_TEXTS.pop(job.job_id, None)
                 JOBS.pop(job.job_id, None)
-
                 user_list = USER_JOBS.get(job.user_id, [])
                 if job.job_id in user_list:
                     user_list.remove(job.job_id)
-
                 if not user_list:
                     USER_JOBS.pop(job.user_id, None)
 
+            save_persistent_queue()
+            await refresh_global_status(force=True)
+
             logging.info(
                 "Queue worker %s finished job=%s status=%s",
-                worker_id,
-                job.job_id,
-                job.status,
+                worker_id, job.job_id, job.status,
             )
 
+            # 网络/Telegram 临时中断时，worker 仍在运行则重新放回 FIFO。
+            # 如果整个进程正在退出，不会执行到这里的下一轮；queue.json 已保留任务，
+            # 下一次启动会自动恢复。
+            if job.status == "排队中" and not job.cancelled:
+                await asyncio.sleep(5)
+                await JOB_QUEUE.put(job)
 
 
 async def register_bot_commands():
@@ -2719,6 +3094,7 @@ async def register_bot_commands():
         types.BotCommand("queue", "查看任务队列"),
         types.BotCommand("cancel", "取消一个任务"),
         types.BotCommand("cancelall", "取消全部任务"),
+        types.BotCommand("clearqueue", "清空任务队列"),
         types.BotCommand("clearcache", "清理残留缓存"),
     ]
 
@@ -2779,9 +3155,28 @@ async def main():
 
     await register_bot_commands()
 
+    # 从磁盘恢复任务：上次“运行中”统一回到排队，完整 ready=True 缓存可直接复用，
+    # 未完成缓存会在 run_transfer 中被清理并重新下载。
+    restored_jobs = load_persistent_queue()
+    rebuild_job_indexes(restored_jobs)
+
+    if restored_jobs:
+        for job in restored_jobs:
+            await JOB_QUEUE.put(job)
+        try:
+            await create_or_move_global_status(force_new=False)
+            await refresh_global_status(force=True)
+        except Exception:
+            logging.exception("Failed to restore global status message.")
+
     logging.info(
         "Bot started: @%s",
         me.username or me.id,
+    )
+
+    logging.info(
+        "Restored persistent jobs: %s",
+        len(restored_jobs),
     )
 
     logging.info(
