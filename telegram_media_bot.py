@@ -184,6 +184,7 @@ BATCH_TOTAL = 0
 BATCH_COMPLETED = 0
 BATCH_FAILED = 0
 BATCH_CANCELLED = 0
+FAILED_TASKS = []
 JOB_STATUS_TEXTS = {}
 CURRENT_JOB_ID = ContextVar("current_job_id", default=None)
 PERSISTENCE_LOCK = asyncio.Lock()
@@ -237,6 +238,7 @@ def save_persistent_queue():
             "failed": BATCH_FAILED,
             "cancelled": BATCH_CANCELLED,
         },
+        "failed_tasks": FAILED_TASKS,
         "status": {
             "chat_id": GLOBAL_STATUS_CHAT_ID,
             "message_id": GLOBAL_STATUS_MESSAGE_ID,
@@ -248,6 +250,7 @@ def save_persistent_queue():
 
 def load_persistent_queue():
     global BATCH_TOTAL, BATCH_COMPLETED, BATCH_FAILED, BATCH_CANCELLED
+    global FAILED_TASKS
     global GLOBAL_STATUS_CHAT_ID, GLOBAL_STATUS_MESSAGE_ID, GLOBAL_LAST_USER_MESSAGE_ID
 
     if not TASKS_FILE.exists():
@@ -264,6 +267,7 @@ def load_persistent_queue():
     BATCH_COMPLETED = int(batch.get("completed", 0) or 0)
     BATCH_FAILED = int(batch.get("failed", 0) or 0)
     BATCH_CANCELLED = int(batch.get("cancelled", 0) or 0)
+    FAILED_TASKS = list(data.get("failed_tasks") or [])
 
     status = data.get("status") or {}
     GLOBAL_STATUS_CHAT_ID = status.get("chat_id")
@@ -736,65 +740,67 @@ def get_status_lock(message_id):
     return lock
 
 
-async def _resume_status_after_flood(message):
-    """FloodWait 结束后自动补一次最后状态，然后恢复正常限速。"""
-    message_id = getattr(message, "id", None)
-    if message_id is None:
-        return
+async def _scheduled_status_edit(message, message_id):
+    """统一状态消息的 5 秒调度器。
 
+    规则：
+      - 同一条状态消息从最近一次成功编辑开始，至少间隔 5 秒。
+      - 5 秒内产生的任意多次状态变化只保留最后状态。
+      - 到第 5 秒自动发送最后状态，不需要再等下一次进度回调。
+      - force 参数不再绕过 5 秒限制。
+      - Telegram 返回的 FloodWait 秒数不参与计算；仍按固定 5 秒重试。
+    """
     try:
-        flood_until = STATUS_EDIT_FLOOD_UNTIL.get(message_id, 0.0)
-        delay = max(0.0, flood_until - time.monotonic())
-        if delay > 0:
-            await asyncio.sleep(delay)
+        while True:
+            next_allowed = STATUS_EDIT_NEXT_ALLOWED.get(message_id, 0.0)
+            delay = max(0.0, next_allowed - time.monotonic())
+            if delay > 0:
+                await asyncio.sleep(delay)
 
-        # 如果期间又发生了新的 FloodWait，则以最新冷却时间为准。
-        latest_until = STATUS_EDIT_FLOOD_UNTIL.get(message_id, 0.0)
-        remaining = latest_until - time.monotonic()
-        if remaining > 0:
-            await asyncio.sleep(remaining)
+            lock = get_status_lock(message_id)
+            async with lock:
+                next_allowed = STATUS_EDIT_NEXT_ALLOWED.get(message_id, 0.0)
+                remaining = next_allowed - time.monotonic()
+                if remaining > 0:
+                    continue
 
-        lock = get_status_lock(message_id)
-        async with lock:
-            # 再检查一次，避免等待期间又收到新的限制。
-            latest_until = STATUS_EDIT_FLOOD_UNTIL.get(message_id, 0.0)
-            remaining = latest_until - time.monotonic()
-            if remaining > 0:
-                await asyncio.sleep(remaining)
+                latest_text = STATUS_EDIT_LAST_TEXT.get(message_id)
+                if not latest_text:
+                    return
 
-            last_text = STATUS_EDIT_LAST_TEXT.get(message_id)
-            if last_text:
                 try:
-                    await message.edit(last_text)
+                    await message.edit(latest_text)
                     STATUS_EDIT_NEXT_ALLOWED[message_id] = (
                         time.monotonic() + STATUS_EDIT_MIN_INTERVAL
                     )
                     STATUS_EDIT_FLOOD_UNTIL.pop(message_id, None)
+                    return
                 except Exception as e:
-                    wait_seconds = getattr(e, "seconds", None)
-                    if type(e).__name__ == "FloodWaitError" and wait_seconds is not None:
-                        STATUS_EDIT_FLOOD_UNTIL[message_id] = (
-                            time.monotonic() + float(wait_seconds) + 1.0
+                    if type(e).__name__ == "FloodWaitError":
+                        # 不采用 Telegram 返回的 seconds；统一固定 5 秒后重试。
+                        STATUS_EDIT_NEXT_ALLOWED[message_id] = (
+                            time.monotonic() + STATUS_EDIT_MIN_INTERVAL
                         )
                         logging.warning(
-                            "Status message still rate-limited after cooldown: "
-                            "message_id=%s wait=%ss",
+                            "Status message edit rate-limited: message_id=%s; "
+                            "fixed 5s retry scheduled; transfer continues.",
                             message_id,
-                            wait_seconds,
                         )
-                    else:
-                        logging.warning(
-                            "Status message resume failed: message_id=%s "
-                            "error=%s: %s",
-                            message_id,
-                            type(e).__name__,
-                            e,
-                        )
+                        continue
+
+                    logging.warning(
+                        "Status message edit failed: message_id=%s "
+                        "error=%s: %s",
+                        message_id,
+                        type(e).__name__,
+                        e,
+                    )
+                    return
     except asyncio.CancelledError:
         raise
     except Exception:
         logging.exception(
-            "Status message flood recovery failed: message_id=%s",
+            "Scheduled status edit failed: message_id=%s",
             message_id,
         )
     finally:
@@ -803,7 +809,8 @@ async def _resume_status_after_flood(message):
             STATUS_EDIT_RETRY_TASKS.pop(message_id, None)
 
 
-async def edit_status(message, text, force=False):
+async def edit_status(message, text):
+    """记录最新状态，并按整条状态消息统一 5 秒节流。"""
     global GLOBAL_STATUS_MESSAGE
 
     if GLOBAL_STATUS_MESSAGE is not None:
@@ -826,37 +833,45 @@ async def edit_status(message, text, force=False):
     lock = get_status_lock(message_id)
     async with lock:
         now = time.monotonic()
-        flood_until = STATUS_EDIT_FLOOD_UNTIL.get(message_id, 0.0)
-        if now < flood_until:
-            if message_id not in STATUS_EDIT_RETRY_TASKS:
-                task = asyncio.create_task(_resume_status_after_flood(message))
-                STATUS_EDIT_RETRY_TASKS[message_id] = task
-            return
-
         next_allowed = STATUS_EDIT_NEXT_ALLOWED.get(message_id, 0.0)
-        if not force and now < next_allowed:
+
+        if now < next_allowed:
+            # 已经有定时任务就不重复创建；后续所有更新只覆盖 LAST_TEXT。
+            if message_id not in STATUS_EDIT_RETRY_TASKS:
+                task = asyncio.create_task(
+                    _scheduled_status_edit(message, message_id)
+                )
+                STATUS_EDIT_RETRY_TASKS[message_id] = task
             return
 
         try:
             await message.edit(rendered)
-            STATUS_EDIT_NEXT_ALLOWED[message_id] = time.monotonic() + STATUS_EDIT_MIN_INTERVAL
+            STATUS_EDIT_NEXT_ALLOWED[message_id] = (
+                time.monotonic() + STATUS_EDIT_MIN_INTERVAL
+            )
         except Exception as e:
-            wait_seconds = getattr(e, "seconds", None)
-            if type(e).__name__ == "FloodWaitError" and wait_seconds is not None:
-                until = time.monotonic() + float(wait_seconds) + 1.0
-                STATUS_EDIT_FLOOD_UNTIL[message_id] = until
-                STATUS_EDIT_NEXT_ALLOWED[message_id] = until
+            if type(e).__name__ == "FloodWaitError":
+                # Telegram 的返回等待时间不参与计算，统一按 5 秒处理。
+                STATUS_EDIT_NEXT_ALLOWED[message_id] = (
+                    time.monotonic() + STATUS_EDIT_MIN_INTERVAL
+                )
                 if message_id not in STATUS_EDIT_RETRY_TASKS:
-                    task = asyncio.create_task(_resume_status_after_flood(message))
+                    task = asyncio.create_task(
+                        _scheduled_status_edit(message, message_id)
+                    )
                     STATUS_EDIT_RETRY_TASKS[message_id] = task
                 logging.warning(
-                    "Status message edit rate-limited: message_id=%s wait=%ss; automatic recovery scheduled; transfer continues.",
-                    message_id, wait_seconds,
+                    "Status message edit rate-limited: message_id=%s; "
+                    "fixed 5s retry scheduled; transfer continues.",
+                    message_id,
                 )
             else:
                 logging.warning(
-                    "Status message edit failed: message_id=%s error=%s: %s",
-                    message_id, type(e).__name__, e,
+                    "Status message edit failed: message_id=%s "
+                    "error=%s: %s",
+                    message_id,
+                    type(e).__name__,
+                    e,
                 )
 
 def release_status_lock(message_id):
@@ -913,15 +928,20 @@ async def create_or_move_global_status(event=None, force_new=False):
             reply_to=reply_to,
         )
         GLOBAL_STATUS_MESSAGE_ID = GLOBAL_STATUS_MESSAGE.id
+        # 新链接创建的是一条全新的状态消息：发送本身立即可见，
+        # 从这次发送开始计算整条状态消息的 5 秒周期。
+        STATUS_EDIT_NEXT_ALLOWED[GLOBAL_STATUS_MESSAGE.id] = (
+            time.monotonic() + STATUS_EDIT_MIN_INTERVAL
+        )
 
     save_persistent_queue()
     return GLOBAL_STATUS_MESSAGE
 
 
-async def refresh_global_status(force=False):
+async def refresh_global_status():
     if GLOBAL_STATUS_MESSAGE is None:
         return
-    await edit_status(GLOBAL_STATUS_MESSAGE, queue_status_text(), force=force)
+    await edit_status(GLOBAL_STATUS_MESSAGE, queue_status_text())
     save_persistent_queue()
 
 
@@ -2300,7 +2320,6 @@ async def send_album_from_handles(
                 status_message,
                 f"📦 媒体组发送完成\n"
                 f"{len(files)} 个媒体",
-                force=True,
             )
         )
 
@@ -2535,6 +2554,14 @@ async def queue_handler(event):
         await event.reply("你没有权限使用此 Bot。")
         return
 
+    # /queue 是查看命令：每次查看时都重新建立总状态盒子。
+    # 先删除旧盒子，再把新的状态消息发到当前 /queue 消息下面，确保总在最下面。
+    # 新消息从创建这一刻开始计算 5 秒编辑周期。
+    try:
+        await create_or_move_global_status(event=event, force_new=True)
+    except Exception:
+        logging.exception("Failed to rebuild global status message for /queue.")
+
     jobs = USER_JOBS.get(event.sender_id, [])
     lines = []
 
@@ -2610,7 +2637,7 @@ async def cancel_handler(event):
         global BATCH_CANCELLED
         BATCH_CANCELLED += 1
         save_persistent_queue()
-        await refresh_global_status(force=True)
+        await refresh_global_status()
 
         await event.reply(
             f"🛑 已取消排队任务 [{job.job_id[:8]}]"
@@ -2650,7 +2677,7 @@ async def cancelall_handler(event):
     total = cancelled_running + cancelled_queued
 
     save_persistent_queue()
-    await refresh_global_status(force=True)
+    await refresh_global_status()
 
     if total:
         await event.reply(
@@ -2693,11 +2720,38 @@ async def clearqueue_handler(event):
         except asyncio.QueueEmpty:
             break
 
-    global BATCH_TOTAL, BATCH_COMPLETED, BATCH_FAILED, BATCH_CANCELLED
+    global BATCH_TOTAL, BATCH_COMPLETED, BATCH_FAILED, BATCH_CANCELLED, FAILED_TASKS
     BATCH_TOTAL = BATCH_COMPLETED = BATCH_FAILED = BATCH_CANCELLED = 0
+    FAILED_TASKS.clear()
     save_persistent_queue()
-    await refresh_global_status(force=True)
+    await refresh_global_status()
     await event.reply("🧹 任务队列已全部清空。\n缓存不会删除。")
+
+
+@client.on(events.NewMessage(pattern=r"^/failed$"))
+async def failed_handler(event):
+    if not is_allowed(event.sender_id):
+        await event.reply("你没有权限使用此 Bot。")
+        return
+
+    user_id = int(event.sender_id)
+    links = [
+        item.get("link", "")
+        for item in FAILED_TASKS
+        if int(item.get("user_id", 0) or 0) == user_id and item.get("link")
+    ]
+
+    if not links:
+        await event.reply("当前没有失败任务链接。")
+        return
+
+    lines = [f"❌ 失败任务：{len(links)} 个", ""]
+    for index, link in enumerate(links, 1):
+        lines.append(f"{index}. {link}")
+
+    text = "\n".join(lines)
+    for start in range(0, len(text), 3800):
+        await event.reply(text[start:start + 3800])
 
 
 @client.on(events.NewMessage(pattern=r"^/clearcache$"))
@@ -2948,6 +3002,7 @@ async def link_handler(event):
     # 如果上一批已经全部结束，新来的链接开启新的一批统计。
     if active_job_count() == 0:
         BATCH_TOTAL = BATCH_COMPLETED = BATCH_FAILED = BATCH_CANCELLED = 0
+        FAILED_TASKS.clear()
         JOB_STATUS_TEXTS.clear()
 
     GLOBAL_LAST_USER_MESSAGE_ID = event.id
@@ -2975,7 +3030,7 @@ async def link_handler(event):
         await JOB_QUEUE.put(job)
 
     save_persistent_queue()
-    await refresh_global_status(force=True)
+    await refresh_global_status()
 
 
 async def transfer_worker(worker_id):
@@ -2992,7 +3047,7 @@ async def transfer_worker(worker_id):
 
             job.status = "运行中"
             save_persistent_queue()
-            await refresh_global_status(force=True)
+            await refresh_global_status()
 
             logging.info(
                 "Queue worker %s starting job=%s user=%s running=%s/%s",
@@ -3051,6 +3106,11 @@ async def transfer_worker(worker_id):
             else:
                 job.status = "失败"
                 BATCH_FAILED += 1
+                FAILED_TASKS.append({
+                    "job_id": job.job_id,
+                    "user_id": int(job.user_id),
+                    "link": job.link,
+                })
                 logging.error("Job failed: %s", job.job_id)
 
         finally:
@@ -3070,7 +3130,7 @@ async def transfer_worker(worker_id):
                     USER_JOBS.pop(job.user_id, None)
 
             save_persistent_queue()
-            await refresh_global_status(force=True)
+            await refresh_global_status()
 
             logging.info(
                 "Queue worker %s finished job=%s status=%s",
@@ -3095,6 +3155,7 @@ async def register_bot_commands():
         types.BotCommand("cancel", "取消一个任务"),
         types.BotCommand("cancelall", "取消全部任务"),
         types.BotCommand("clearqueue", "清空任务队列"),
+        types.BotCommand("failed", "查看失败任务链接"),
         types.BotCommand("clearcache", "清理残留缓存"),
     ]
 
@@ -3165,7 +3226,7 @@ async def main():
             await JOB_QUEUE.put(job)
         try:
             await create_or_move_global_status(force_new=False)
-            await refresh_global_status(force=True)
+            await refresh_global_status()
         except Exception:
             logging.exception("Failed to restore global status message.")
 
