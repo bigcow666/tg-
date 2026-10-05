@@ -34,10 +34,15 @@ ALLOWED_USERS = {
 DEFAULT_TARGET_CHAT_ID = -1001234567890
 
 # 缓存总上限
-MAX_CACHE_GB = 10
+MAX_CACHE_GB = 15
 
 # 视频超过这个大小就按关键帧切分；不重新编码
 SPLIT_SIZE_MB = 1900
+
+# Album 诊断模式：
+# False = 正常运行
+# True = Album 发送失败后，逐个单独发送测试
+ALBUM_DIAGNOSTIC_MODE = True
 
 # Telegram 媒体组最多 10 个媒体。
 # 为了避免 GetHistoryRequest，这里只用“精确消息 ID 查询”探测同组成员。
@@ -2215,6 +2220,14 @@ async def send_album_from_handles(
                 )
             )
             fm = utils.get_input_media(uploaded_result.photo)
+            logging.info(
+    "Album media debug: file=%s handle=%s result=%s photo=%s fm=%s",
+    path.name,
+    type(handle).__name__,
+    type(uploaded_result).__name__,
+    type(getattr(uploaded_result, "photo", None)).__name__,
+    type(fm).__name__,
+)
 
         elif suffix in (".mp4", ".m4v", ".mov", ".webm"):
             duration, width, height = await _get_video_metadata(path)
@@ -2238,7 +2251,7 @@ async def send_album_from_handles(
                     mime_type="video/mp4",
                     attributes=attributes,
                     force_file=False,
-                    nosound_video=False,
+                    nosound_video=True,
                 )
                 uploaded_result = await client(
                     functions.messages.UploadMediaRequest(
@@ -2256,6 +2269,14 @@ async def send_album_from_handles(
                 uploaded_result.document,
                 supports_streaming=True,
             )
+            logging.info(
+    "Album media debug: file=%s handle=%s result=%s document=%s fm=%s",
+    path.name,
+    type(handle).__name__,
+    type(uploaded_result).__name__,
+    type(getattr(uploaded_result, "document", None)).__name__,
+    type(fm).__name__,
+)
 
         else:
             uploaded = types.InputMediaUploadedDocument(
@@ -2273,6 +2294,14 @@ async def send_album_from_handles(
                 )
             )
             fm = utils.get_input_media(uploaded_result.document)
+            logging.info(
+    "Album media debug: file=%s handle=%s result=%s document=%s fm=%s",
+    path.name,
+    type(handle).__name__,
+    type(uploaded_result).__name__,
+    type(getattr(uploaded_result, "document", None)).__name__,
+    type(fm).__name__,
+)
 
         media.append(fm)
 
@@ -2287,6 +2316,7 @@ async def send_album_from_handles(
             multi_media.append(
                 types.InputSingleMedia(
                     media=media_item,
+                    random_id=secrets.randbits(63),
                     message=msg,
                 )
             )
@@ -2298,12 +2328,91 @@ async def send_album_from_handles(
             [Path(f).name for f in files[chunk_start:chunk_start + 10]],
         )
 
-        result = await client(
-            functions.messages.SendMultiMediaRequest(
-                peer=entity,
-                multi_media=multi_media,
+        try:
+            result = await client(
+                functions.messages.SendMultiMediaRequest(
+                    peer=entity,
+                    multi_media=multi_media,
+                )
             )
-        )
+
+            logging.info(
+                "Native SendMultiMedia RETURNED: target=%s count=%s result=%s",
+                target,
+                len(chunk_media),
+                type(result).__name__,
+            )
+
+        except Exception as album_error:
+            logging.exception(
+                "Album SendMultiMedia FAILED: %s",
+                album_error,
+            )
+
+            if ALBUM_DIAGNOSTIC_MODE:
+                logging.error(
+                    "Album diagnostic fallback START: count=%s",
+                    len(chunk_media),
+                )
+
+                single_errors = []
+
+                for index, media_item in enumerate(chunk_media):
+                    file_name = Path(
+                        files[chunk_start + index]
+                    ).name
+
+                    logging.info(
+                        "Single Send START: index=%s file=%s type=%s",
+                        index + 1,
+                        file_name,
+                        type(media_item).__name__,
+                    )
+
+                    try:
+                        single_result = await client(
+                            functions.messages.SendMediaRequest(
+                                peer=entity,
+                                media=media_item,
+                                message=(
+                                    caption
+                                    if caption and index == 0
+                                    else ""
+                                ),
+                            )
+                        )
+
+                        logging.info(
+                            "Single Send OK: index=%s file=%s result=%s",
+                            index + 1,
+                            file_name,
+                            type(single_result).__name__,
+                        )
+
+                    except Exception as single_error:
+                        single_errors.append(
+                            (file_name, single_error)
+                        )
+
+                        logging.exception(
+                            "Single Send FAILED: index=%s file=%s error=%s",
+                            index + 1,
+                            file_name,
+                            single_error,
+                        )
+
+                logging.error(
+                    "Album diagnostic fallback END: success=%s failed=%s",
+                    len(chunk_media) - len(single_errors),
+                    len(single_errors),
+                )
+
+                if single_errors:
+                    raise album_error
+
+                continue
+
+            raise
 
         logging.info(
             "Native SendMultiMedia RETURNED: target=%s count=%s result=%s",
