@@ -8,6 +8,7 @@ import re
 import shutil
 import secrets
 import subprocess
+import sys
 import time
 import uuid
 from contextvars import ContextVar
@@ -16,6 +17,9 @@ from types import SimpleNamespace
 
 from telethon import TelegramClient, events, functions, types, utils
 from telethon.sessions import MemorySession
+# >>> 修改开始：支持 NEO 风格的 StringSession 用户授权
+from telethon.sessions import StringSession
+# <<< 修改结束
 from telethon.errors import FloodWaitError
 
 # ============================================================
@@ -24,6 +28,11 @@ from telethon.errors import FloodWaitError
 API_ID = 12345678
 API_HASH = "PUT_YOUR_API_HASH_HERE"
 BOT_TOKEN = "PUT_YOUR_BOT_TOKEN_HERE"
+
+# >>> 修改开始：普通用户登录为可选项，默认关闭
+ENABLE_USER_LOGIN = False
+USER_SESSION_STRING = ""
+# <<< 修改结束
 
 # 只允许这些 Telegram User ID 使用
 ALLOWED_USERS = {
@@ -143,6 +152,27 @@ client = TelegramClient(
     API_ID,
     API_HASH,
 )
+
+# >>> 修改开始：仅启用时创建普通用户客户端；机器人 client 保持不变
+user_client = None
+if ENABLE_USER_LOGIN and USER_SESSION_STRING.strip():
+    user_client = TelegramClient(
+        StringSession(USER_SESSION_STRING.strip()),
+        API_ID,
+        API_HASH,
+    )
+
+
+def get_source_client():
+    """来源读取客户端；上传、命令、状态消息仍然使用机器人 client。"""
+    if ENABLE_USER_LOGIN:
+        if user_client is None:
+            raise RuntimeError(
+                "已启用用户登录，但 USER_SESSION_STRING 为空。"
+            )
+        return user_client
+    return client
+# <<< 修改结束
 
 # ============================================================
 # 用户配置
@@ -606,10 +636,12 @@ def ensure_cache_room(exclude=None):
 # ============================================================
 # Telegram 链接
 # ============================================================
+# >>> 修改开始：匹配时保留 ?comment=... 查询参数
 TG_LINK_RE = re.compile(
-    r"(?:https?://)?t\.me/(?:c/)?([^/\s]+)/(\d+)",
+    r"(?:https?://)?t\.me/(?:c/)?([^/\s?]+)/(\d+)(?:\?[^\s]*)?",
     re.IGNORECASE,
 )
+# <<< 修改结束
 
 
 def parse_message_link(text):
@@ -637,6 +669,15 @@ def parse_message_link(text):
 
     return peer, message_id
 
+
+# >>> 修改开始：提取评论消息 ID
+
+def parse_comment_id(link):
+    match = re.search(r"[?&]comment=(\d+)", link, re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+# <<< 修改结束
+
 # ============================================================
 # 关键：只查询指定消息 ID
 #
@@ -647,8 +688,10 @@ def parse_message_link(text):
 #
 # 因此不会再触发之前的 GetHistoryRequest。
 # ============================================================
-async def get_linked_message(peer, message_id):
-    message = await client.get_messages(
+# >>> 修改开始：来源消息可选择机器人客户端或普通用户客户端
+async def get_linked_message(peer, message_id, source_client=None):
+    source_client = source_client or get_source_client()
+    message = await source_client.get_messages(
         peer,
         ids=message_id,
     )
@@ -659,7 +702,55 @@ async def get_linked_message(peer, message_id):
     return message
 
 
-async def get_album_messages(peer, linked_message):
+async def get_comment_message(channel_peer, post_id, comment_id):
+    """通过普通用户账号查找频道帖子关联的讨论群，再读取指定评论。"""
+    if not ENABLE_USER_LOGIN or user_client is None:
+        raise RuntimeError("评论链接需要先启用普通用户登录。")
+
+    discussion = await user_client(
+        functions.messages.GetDiscussionMessageRequest(
+            peer=channel_peer,
+            msg_id=post_id,
+        )
+    )
+
+    source_entity = await user_client.get_entity(channel_peer)
+    source_peer_id = utils.get_peer_id(source_entity)
+
+    candidates = []
+    for chat in getattr(discussion, "chats", []) or []:
+        if not isinstance(chat, (types.Channel, types.Chat)):
+            continue
+        try:
+            chat_peer_id = utils.get_peer_id(chat)
+        except Exception:
+            continue
+        if chat_peer_id != source_peer_id:
+            candidates.append(chat)
+
+    # 优先选择关联的超级群组；没有 megagroup 标记时使用第一个非来源群组。
+    discussion_chat = next(
+        (
+            chat for chat in candidates
+            if isinstance(chat, types.Channel)
+            and getattr(chat, "megagroup", False)
+        ),
+        candidates[0] if candidates else None,
+    )
+
+    if discussion_chat is None:
+        return None, None
+
+    discussion_peer = utils.get_peer_id(discussion_chat)
+    comment_message = await get_linked_message(
+        discussion_peer,
+        comment_id,
+        source_client=user_client,
+    )
+    return discussion_peer, comment_message
+
+
+async def get_album_messages(peer, linked_message, source_client=None):
     """
     先精确获取链接消息。
 
@@ -672,6 +763,8 @@ async def get_album_messages(peer, linked_message):
 
     if not linked_message:
         return []
+
+    source_client = source_client or getattr(linked_message, "_client", None) or get_source_client()
 
     if not linked_message.grouped_id:
         return [linked_message]
@@ -690,10 +783,12 @@ async def get_album_messages(peer, linked_message):
         end,
     )
 
-    messages = await client.get_messages(
+    # >>> 修改开始：媒体组成员必须使用读取原消息的同一客户端
+    messages = await source_client.get_messages(
         peer,
         ids=candidate_ids,
     )
+    # <<< 修改结束
 
     if not isinstance(messages, list):
         messages = [messages] if messages else []
@@ -1355,7 +1450,9 @@ async def download_message_parallel(
 
         try:
             with open(part_path, "wb") as fp:
-                async for data in client.iter_download(
+                # >>> 修改开始：大文件下载使用该消息所属的客户端
+                source_client = getattr(message, "_client", None) or get_source_client()
+                async for data in source_client.iter_download(
                     message.media,
                     offset=start_offset,
                     limit=expected,
@@ -2910,6 +3007,19 @@ async def run_transfer(event, link, status_message=None, cache_dir=None):
     peer, message_id = parsed
     target = user["target"]
 
+    # >>> 修改开始：评论链接先解析关联讨论群和评论消息
+    comment_id = parse_comment_id(link)
+    if comment_id is not None:
+        if not ENABLE_USER_LOGIN or user_client is None:
+            await edit_status(
+                status_message,
+                "❌ 这是评论区链接，请先启用普通用户登录并配置 USER_SESSION_STRING。",
+            )
+            return False
+        source_client = user_client
+    else:
+        source_client = get_source_client()
+
     # 新任务优先复用已经存在的完整缓存；没有才创建新缓存目录。
     if cache_dir:
         task_dir = Path(cache_dir)
@@ -2928,18 +3038,36 @@ async def run_transfer(event, link, status_message=None, cache_dir=None):
                 "🔎 正在读取链接消息..."
             )
 
-        # 第一步：只获取链接指定的那一条消息
-        linked_message = await get_linked_message(
-            peer,
-            message_id,
-        )
+        # >>> 修改开始：普通链接与评论链接分别读取；评论缓存键使用讨论群+评论 ID
+        if comment_id is not None:
+            source_peer, linked_message = await get_comment_message(
+                peer,
+                message_id,
+                comment_id,
+            )
+            source_message_id = comment_id
+            if source_peer is None or linked_message is None:
+                await edit_status(
+                    status_message,
+                    "❌ 找不到评论消息。请确认普通账号能访问关联讨论群，且评论 ID 正确。",
+                )
+                return False
+        else:
+            source_peer = peer
+            source_message_id = message_id
+            linked_message = await get_linked_message(
+                peer,
+                message_id,
+                source_client=source_client,
+            )
 
         if not linked_message:
             await edit_status(
                 status_message,
-                "❌ 找不到这个消息。\n请确认 Bot 能访问源群/频道。"
+                "❌ 找不到这个消息。请确认当前来源账号有权限访问源群/频道。"
             )
             return False
+        # <<< 修改结束
 
         if not linked_message.media:
             await edit_status(
@@ -2950,8 +3078,9 @@ async def run_transfer(event, link, status_message=None, cache_dir=None):
 
         # 第二步：如果是媒体组，精确探测同 grouped_id 的成员
         messages = await get_album_messages(
-            peer,
+            source_peer,
             linked_message,
+            source_client=source_client,
         )
 
         if not messages:
@@ -2961,7 +3090,9 @@ async def run_transfer(event, link, status_message=None, cache_dir=None):
             )
             return False
 
-        cached = find_cached_task(peer, message_id)
+        # >>> 修改开始：评论媒体按实际讨论群 Peer 和评论消息 ID 匹配缓存
+        cached = find_cached_task(source_peer, source_message_id)
+        # <<< 修改结束
         if cached:
             cached_dir, cached_data, cached_files = cached
             # 刚创建的临时目录没有用处，直接释放；真正缓存进入占用状态。
@@ -3001,8 +3132,8 @@ async def run_transfer(event, link, status_message=None, cache_dir=None):
             "Transfer: user=%s peer=%s message=%s "
             "album=%s count=%s target=%s",
             event.sender_id,
-            peer,
-            message_id,
+            source_peer,
+            source_message_id,
             linked_message.grouped_id,
             len(messages),
             target,
@@ -3021,7 +3152,7 @@ async def run_transfer(event, link, status_message=None, cache_dir=None):
             target,
             task_dir,
             status_message=status_message,
-            source_peer=peer,
+            source_peer=source_peer,
         )
 
         # send_album_from_handles 已经安排最终状态更新。
@@ -3122,7 +3253,13 @@ async def link_handler(event):
 
     for link_text, (peer, message_id) in links:
         job_id = uuid.uuid4().hex
-        cached_dir = note_new_cache_task(peer, message_id)
+        # >>> 修改开始：评论链接尚未解析讨论群，不能用频道帖子 ID 预登记缓存
+        cached_dir = (
+            None
+            if parse_comment_id(link_text) is not None
+            else note_new_cache_task(peer, message_id)
+        )
+        # <<< 修改结束
         job = TransferJob(
             job_id=job_id,
             user_id=event.sender_id,
@@ -3284,6 +3421,31 @@ async def register_bot_commands():
 # ============================================================
 # 启动
 # ============================================================
+# >>> 修改开始：提供内置用户 Session String 生成模式，无需另建脚本
+async def generate_user_session():
+    if API_ID == 12345678 or API_HASH == "PUT_YOUR_API_HASH_HERE":
+        raise RuntimeError(
+            "请先在配置区填写真实 API_ID 和 API_HASH，再运行 --login-user。"
+        )
+
+    login_client = TelegramClient(
+        StringSession(),
+        API_ID,
+        API_HASH,
+    )
+    try:
+        await login_client.start()
+        me = await login_client.get_me()
+        session_string = login_client.session.save()
+        print("\n登录成功。以下是 USER_SESSION_STRING，请妥善保管：\n")
+        print(session_string)
+        print("\n账号：@%s（ID：%s）" % (me.username or "无用户名", me.id))
+        print("将字符串填入配置区 USER_SESSION_STRING，并设置 ENABLE_USER_LOGIN = True。")
+    finally:
+        await login_client.disconnect()
+# <<< 修改结束
+
+
 async def main():
     setup_logging()
     acquire_single_instance()
@@ -3320,6 +3482,28 @@ async def main():
     await client.start(
         bot_token=BOT_TOKEN
     )
+
+    # >>> 修改开始：按开关连接并验证普通用户 Session
+    if ENABLE_USER_LOGIN:
+        if user_client is None:
+            raise RuntimeError(
+                "已启用用户登录，但 USER_SESSION_STRING 为空。"
+            )
+        await user_client.connect()
+        if not await user_client.is_user_authorized():
+            await user_client.disconnect()
+            raise RuntimeError(
+                "USER_SESSION_STRING 未授权或已失效，请重新生成 Session String。"
+            )
+        user_me = await user_client.get_me()
+        logging.info(
+            "Optional user session enabled: user_id=%s username=%s",
+            user_me.id,
+            user_me.username or "(no username)",
+        )
+    else:
+        logging.info("Optional user session disabled; using bot client for source reads.")
+    # <<< 修改结束
 
     me = await client.get_me()
 
@@ -3380,9 +3564,19 @@ async def main():
 
         QUEUE_WORKERS.clear()
 
+        # >>> 修改开始：正常退出时关闭可选用户客户端
+        if user_client is not None and user_client.is_connected():
+            await user_client.disconnect()
+        # <<< 修改结束
 
+
+# >>> 修改开始：--login-user 用于一次性生成普通账号 StringSession
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        if "--login-user" in sys.argv:
+            asyncio.run(generate_user_session())
+        else:
+            asyncio.run(main())
     except KeyboardInterrupt:
         print("Bot stopped.")
+# <<< 修改结束
