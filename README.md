@@ -241,7 +241,8 @@ systemctl disable tg-media-bot
 ```
 
 ---
-
+tg登录（账号模式）（可选-用于转载评论区媒体）
+/root/tg_media_bot/venv/bin/python /root/tg_media_bot/telegram_media_bot.py --login-user
 ## 注意事项
 
 - ⚠️ 不要把 `API_ID` / `API_HASH` 和 `BOT_TOKEN` 混用
