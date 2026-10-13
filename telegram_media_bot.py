@@ -2417,250 +2417,6 @@ async def _generate_video_thumbnail(file_path):
         return None
 
 
-async def send_album_from_handles(
-    handles,
-    files,
-    target,
-    caption=None,
-    status_message=None,
-):
-    """使用已上传的 file handles，按 Telethon 官方 Album 流程原生提交。"""
-    if len(handles) != len(files):
-        raise RuntimeError("媒体组上传句柄数量不一致")
-    if not handles:
-        raise RuntimeError("媒体组没有可发送的媒体")
-
-    entity = await client.get_input_entity(target)
-    media = []
-
-    # 这里严格保持 files/handles 的原始顺序。
-    # 每个 handle 已经上传完成，不会重新上传文件内容。
-    for handle, file_path in zip(handles, files):
-        path = Path(file_path)
-        suffix = path.suffix.lower()
-
-        if suffix in (".jpg", ".jpeg", ".png", ".webp"):
-            uploaded = types.InputMediaUploadedPhoto(file=handle)
-            uploaded_result = await client(
-                functions.messages.UploadMediaRequest(
-                    peer=entity,
-                    media=uploaded,
-                )
-            )
-            fm = utils.get_input_media(uploaded_result.photo)
-            logging.info(
-    "Album media debug: file=%s handle=%s result=%s photo=%s fm=%s",
-    path.name,
-    type(handle).__name__,
-    type(uploaded_result).__name__,
-    type(getattr(uploaded_result, "photo", None)).__name__,
-    type(fm).__name__,
-)
-
-        elif suffix in (".mp4", ".m4v", ".mov", ".webm"):
-            duration, width, height = await _get_video_metadata(path)
-            attributes = [
-                types.DocumentAttributeFilename(file_name=path.name),
-                types.DocumentAttributeVideo(
-                    duration=duration,
-                    w=width,
-                    h=height,
-                    supports_streaming=True,
-                ),
-            ]
-            thumb_path = await _generate_video_thumbnail(path)
-            thumb_handle = None
-            try:
-                if thumb_path:
-                    thumb_handle = await client.upload_file(str(thumb_path))
-                uploaded = types.InputMediaUploadedDocument(
-                    file=handle,
-                    thumb=thumb_handle,
-                    mime_type="video/mp4",
-                    attributes=attributes,
-                    force_file=False,
-                    nosound_video=True,
-                )
-                uploaded_result = await client(
-                    functions.messages.UploadMediaRequest(
-                        peer=entity,
-                        media=uploaded,
-                    )
-                )
-            finally:
-                if thumb_path:
-                    try:
-                        thumb_path.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-            fm = utils.get_input_media(
-                uploaded_result.document,
-                supports_streaming=True,
-            )
-            logging.info(
-    "Album media debug: file=%s handle=%s result=%s document=%s fm=%s",
-    path.name,
-    type(handle).__name__,
-    type(uploaded_result).__name__,
-    type(getattr(uploaded_result, "document", None)).__name__,
-    type(fm).__name__,
-)
-
-        else:
-            uploaded = types.InputMediaUploadedDocument(
-                file=handle,
-                mime_type="application/octet-stream",
-                attributes=[
-                    types.DocumentAttributeFilename(file_name=path.name)
-                ],
-                force_file=True,
-            )
-            uploaded_result = await client(
-                functions.messages.UploadMediaRequest(
-                    peer=entity,
-                    media=uploaded,
-                )
-            )
-            fm = utils.get_input_media(uploaded_result.document)
-            logging.info(
-    "Album media debug: file=%s handle=%s result=%s document=%s fm=%s",
-    path.name,
-    type(handle).__name__,
-    type(uploaded_result).__name__,
-    type(getattr(uploaded_result, "document", None)).__name__,
-    type(fm).__name__,
-)
-
-        media.append(fm)
-
-    # Telegram Album 每组最多 10 个；超过 10 个按原顺序分组。
-    for chunk_start in range(0, len(media), 10):
-        chunk_media = media[chunk_start:chunk_start + 10]
-        multi_media = []
-
-        for index, media_item in enumerate(chunk_media):
-            msg = caption if caption and index == 0 else ""
-            # 与 Telethon 官方 _send_album 一致：random_id 由 TL 对象自动处理。
-            multi_media.append(
-                types.InputSingleMedia(
-                    media=media_item,
-                    random_id=secrets.randbits(63),
-                    message=msg,
-                )
-            )
-
-        logging.info(
-            "Native SendMultiMedia START: target=%s count=%s files=%s",
-            target,
-            len(chunk_media),
-            [Path(f).name for f in files[chunk_start:chunk_start + 10]],
-        )
-
-        try:
-            result = await client(
-                functions.messages.SendMultiMediaRequest(
-                    peer=entity,
-                    multi_media=multi_media,
-                )
-            )
-
-            logging.info(
-                "Native SendMultiMedia RETURNED: target=%s count=%s result=%s",
-                target,
-                len(chunk_media),
-                type(result).__name__,
-            )
-
-        except Exception as album_error:
-            logging.exception(
-                "Album SendMultiMedia FAILED: %s",
-                album_error,
-            )
-
-            if ALBUM_DIAGNOSTIC_MODE:
-                logging.error(
-                    "Album diagnostic fallback START: count=%s",
-                    len(chunk_media),
-                )
-
-                single_errors = []
-
-                for index, media_item in enumerate(chunk_media):
-                    file_name = Path(
-                        files[chunk_start + index]
-                    ).name
-
-                    logging.info(
-                        "Single Send START: index=%s file=%s type=%s",
-                        index + 1,
-                        file_name,
-                        type(media_item).__name__,
-                    )
-
-                    try:
-                        single_result = await client(
-                            functions.messages.SendMediaRequest(
-                                peer=entity,
-                                media=media_item,
-                                message=(
-                                    caption
-                                    if caption and index == 0
-                                    else ""
-                                ),
-                            )
-                        )
-
-                        logging.info(
-                            "Single Send OK: index=%s file=%s result=%s",
-                            index + 1,
-                            file_name,
-                            type(single_result).__name__,
-                        )
-
-                    except Exception as single_error:
-                        single_errors.append(
-                            (file_name, single_error)
-                        )
-
-                        logging.exception(
-                            "Single Send FAILED: index=%s file=%s error=%s",
-                            index + 1,
-                            file_name,
-                            single_error,
-                        )
-
-                logging.error(
-                    "Album diagnostic fallback END: success=%s failed=%s",
-                    len(chunk_media) - len(single_errors),
-                    len(single_errors),
-                )
-
-                if single_errors:
-                    raise album_error
-
-                continue
-
-            raise
-
-        logging.info(
-            "Native SendMultiMedia RETURNED: target=%s count=%s result=%s",
-            target,
-            len(chunk_media),
-            type(result).__name__,
-        )
-
-    if status_message:
-        # 最终状态不阻塞当前任务：发送成功后立即把控制权交还队列。
-        # Telegram 状态编辑在后台执行；如果遇到限流，edit_status 自己负责恢复。
-        asyncio.create_task(
-            edit_status(
-                status_message,
-                f"📦 媒体组发送完成\n"
-                f"{len(files)} 个媒体",
-            )
-        )
-
-
 async def upload_media_group(
     files,
     target,
@@ -2668,14 +2424,15 @@ async def upload_media_group(
     status_message=None,
 ):
     """
-    阶段 1：逐个上传文件，单文件最多失败3次。
-    阶段 2：所有文件成功后，一次性作为 Telegram 媒体组发送。
+    阶段 1：逐个上传文件，并【立即】将其固化为 Telegram 媒体对象，防止服务器静默回收。
+    阶段 2：所有媒体固化完毕后，一次性拼装发送媒体组。
     """
-    handles = []
-
     total = len(files)
+    entity = await client.get_input_entity(target)
+    ready_media = []
 
     for index, file_path in enumerate(files, 1):
+        # 1. 物理分块上传，获取临时句柄
         handle = await upload_file_with_retry(
             file_path,
             status_message=status_message,
@@ -2685,32 +2442,140 @@ async def upload_media_group(
         )
 
         if handle is None:
-            raise RuntimeError(
-                f"上传失败：{Path(file_path).name}"
-            )
+            raise RuntimeError(f"上传失败：{Path(file_path).name}")
 
-        handles.append(handle)
+        # 2. 拿到句柄后，立刻调用 UploadMediaRequest 固化
+        path = Path(file_path)
+        suffix = path.suffix.lower()
 
+        if status_message:
+            try:
+                await edit_status(status_message, f"✅ {path.name} 上传完毕\n正在向 Telegram 固化媒体数据...")
+            except Exception:
+                pass
+
+        try:
+            if suffix in (".jpg", ".jpeg", ".png", ".webp"):
+                uploaded = types.InputMediaUploadedPhoto(file=handle)
+                uploaded_result = await client(functions.messages.UploadMediaRequest(peer=entity, media=uploaded))
+                fm = utils.get_input_media(uploaded_result.photo)
+                logging.info("Album media debug: file=%s handle=%s result=%s photo=%s fm=%s", path.name, type(handle).__name__, type(uploaded_result).__name__, type(getattr(uploaded_result, "photo", None)).__name__, type(fm).__name__)
+
+            elif suffix in (".mp4", ".m4v", ".mov", ".webm"):
+                duration, width, height = await _get_video_metadata(path)
+                attributes = [
+                    types.DocumentAttributeFilename(file_name=path.name),
+                    types.DocumentAttributeVideo(
+                        duration=duration,
+                        w=width,
+                        h=height,
+                        supports_streaming=True,
+                    ),
+                ]
+                thumb_path = await _generate_video_thumbnail(path)
+                thumb_handle = None
+                try:
+                    if thumb_path:
+                        thumb_handle = await client.upload_file(str(thumb_path))
+                    uploaded = types.InputMediaUploadedDocument(
+                        file=handle,
+                        thumb=thumb_handle,
+                        mime_type="video/mp4",
+                        attributes=attributes,
+                        force_file=False,
+                        nosound_video=True,
+                    )
+                    uploaded_result = await client(functions.messages.UploadMediaRequest(peer=entity, media=uploaded))
+                finally:
+                    if thumb_path:
+                        try:
+                            thumb_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                fm = utils.get_input_media(uploaded_result.document, supports_streaming=True)
+                logging.info("Album media debug: file=%s handle=%s result=%s document=%s fm=%s", path.name, type(handle).__name__, type(uploaded_result).__name__, type(getattr(uploaded_result, "document", None)).__name__, type(fm).__name__)
+
+            else:
+                uploaded = types.InputMediaUploadedDocument(
+                    file=handle,
+                    mime_type="application/octet-stream",
+                    attributes=[types.DocumentAttributeFilename(file_name=path.name)],
+                    force_file=True,
+                )
+                uploaded_result = await client(functions.messages.UploadMediaRequest(peer=entity, media=uploaded))
+                fm = utils.get_input_media(uploaded_result.document)
+                logging.info("Album media debug: file=%s handle=%s result=%s document=%s fm=%s", path.name, type(handle).__name__, type(uploaded_result).__name__, type(getattr(uploaded_result, "document", None)).__name__, type(fm).__name__)
+
+            ready_media.append(fm)
+
+        except FloodWaitError as e:
+            logging.warning("固化媒体时触发 FloodWait，等待 %s 秒", e.seconds)
+            await asyncio.sleep(e.seconds + 1)
+            raise RuntimeError(f"媒体数据固化被限流中断，请重试 ({e})") from e
+        except Exception as e:
+            raise RuntimeError(f"媒体数据固化失败：{path.name} ({e})") from e
+
+    # 3. 所有媒体固化完毕，开始执行严谨的 Album 拼装
     if status_message:
         try:
-            await edit_status(status_message,
-                f"📦 {total} 个媒体已上传到 Telegram\n"
-                f"正在组装为一个媒体组..."
-            )
+            await edit_status(status_message, f"📦 {total} 个媒体已安全固化\n正在发送媒体组...")
         except Exception:
             pass
 
-    await send_album_from_handles(
-        handles,
-        files,
-        target,
-        caption=caption,
-        status_message=status_message,
-    )
+    for chunk_start in range(0, len(ready_media), 10):
+        chunk_media = ready_media[chunk_start:chunk_start + 10]
+        multi_media = []
+
+        for index, media_item in enumerate(chunk_media):
+            msg = caption if caption and index == 0 else ""
+            multi_media.append(
+                types.InputSingleMedia(
+                    media=media_item,
+                    random_id=secrets.randbits(63),
+                    message=msg,
+                )
+            )
+
+        logging.info("Native SendMultiMedia START: target=%s count=%s files=%s", target, len(chunk_media), [Path(f).name for f in files[chunk_start:chunk_start + 10]])
+
+        try:
+            result = await client(functions.messages.SendMultiMediaRequest(peer=entity, multi_media=multi_media))
+            logging.info("Native SendMultiMedia RETURNED: target=%s count=%s result=%s", target, len(chunk_media), type(result).__name__)
+
+        except Exception as album_error:
+            logging.exception("Album SendMultiMedia FAILED: %s", album_error)
+
+            if ALBUM_DIAGNOSTIC_MODE:
+                logging.error("Album diagnostic fallback START: count=%s", len(chunk_media))
+                single_errors = []
+
+                for index, media_item in enumerate(chunk_media):
+                    file_name = Path(files[chunk_start + index]).name
+                    logging.info("Single Send START: index=%s file=%s type=%s", index + 1, file_name, type(media_item).__name__)
+
+                    try:
+                        single_result = await client(functions.messages.SendMediaRequest(
+                            peer=entity,
+                            media=media_item,
+                            message=caption if caption and index == 0 else ""
+                        ))
+                        logging.info("Single Send OK: index=%s file=%s result=%s", index + 1, file_name, type(single_result).__name__)
+                    except Exception as single_error:
+                        single_errors.append((file_name, single_error))
+                        logging.exception("Single Send FAILED: index=%s file=%s error=%s", index + 1, file_name, single_error)
+
+                logging.error("Album diagnostic fallback END: success=%s failed=%s", len(chunk_media) - len(single_errors), len(single_errors))
+
+                if single_errors:
+                    raise album_error
+                continue
+
+            raise
+
+    if status_message:
+        asyncio.create_task(edit_status(status_message, f"📦 媒体组发送完成\n{len(files)} 个媒体"))
 
     return True
-
-
 
 # ============================================================
 # 媒体组处理
