@@ -47,7 +47,7 @@ DEFAULT_TARGET_CHAT_ID = -1001234567890
 MAX_CACHE_GB = 30
 
 # 视频超过这个大小就按关键帧切分；不重新编码
-SPLIT_SIZE_MB = 1900
+SPLIT_SIZE_MB = 1500
 
 # Album 诊断模式：
 # False = 正常运行
@@ -1864,6 +1864,15 @@ async def _parallel_big_upload(
 
     part_size = UPLOAD_PART_SIZE
     total_parts = (total_size + part_size - 1) // part_size
+    
+    # ====== 新增：在发往服务器前强制拦截超限文件，避免报底层 RPC 错 ======
+    if total_parts > 3999:
+        raise RuntimeError(
+            f"VBR 码率波动导致单个切片过大 (实际体积 {total_size/1024/1024:.1f}MB, "
+            f"分片数 {total_parts} > 3999)。已物理拦截，请调小 SPLIT_SIZE_MB。"
+        )
+    # =========================================================
+
     file_id = secrets.randbits(63)
 
     connections = UPLOAD_CONNECTIONS_MIN
