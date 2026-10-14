@@ -830,7 +830,7 @@ async def get_album_messages(peer, linked_message, source_client=None):
 STATUS_LOCKS = {}
 
 # Telegram 状态消息编辑限速：同一条消息默认至少间隔 3 秒。
-STATUS_EDIT_MIN_INTERVAL = 5.0
+STATUS_EDIT_MIN_INTERVAL = 15.0
 STATUS_EDIT_NEXT_ALLOWED = {}
 STATUS_EDIT_FLOOD_UNTIL = {}
 STATUS_EDIT_LAST_TEXT = {}
@@ -882,14 +882,15 @@ async def _scheduled_status_edit(message, message_id):
                     return
                 except Exception as e:
                     if type(e).__name__ == "FloodWaitError":
-                        # 不采用 Telegram 返回的 seconds；统一固定 5 秒后重试。
+                        # 乖乖听官方的话，要求等多久就等多久，外加 2 秒安全缓冲
+                        wait_seconds = getattr(e, 'seconds', 5) + 2
                         STATUS_EDIT_NEXT_ALLOWED[message_id] = (
-                            time.monotonic() + STATUS_EDIT_MIN_INTERVAL
+                            time.monotonic() + wait_seconds
                         )
                         logging.warning(
                             "Status message edit rate-limited: message_id=%s; "
-                            "fixed 5s retry scheduled; transfer continues.",
-                            message_id,
+                            "waiting for %ss; transfer continues.",
+                            message_id, wait_seconds
                         )
                         continue
 
@@ -956,9 +957,10 @@ async def edit_status(message, text):
             )
         except Exception as e:
             if type(e).__name__ == "FloodWaitError":
-                # Telegram 的返回等待时间不参与计算，统一按 5 秒处理。
+                # 乖乖听官方的话，要求等多久就等多久，外加 2 秒安全缓冲
+                wait_seconds = getattr(e, 'seconds', 5) + 2
                 STATUS_EDIT_NEXT_ALLOWED[message_id] = (
-                    time.monotonic() + STATUS_EDIT_MIN_INTERVAL
+                    time.monotonic() + wait_seconds
                 )
                 if message_id not in STATUS_EDIT_RETRY_TASKS:
                     task = asyncio.create_task(
@@ -967,8 +969,8 @@ async def edit_status(message, text):
                     STATUS_EDIT_RETRY_TASKS[message_id] = task
                 logging.warning(
                     "Status message edit rate-limited: message_id=%s; "
-                    "fixed 5s retry scheduled; transfer continues.",
-                    message_id,
+                    "waiting for %ss; transfer continues.",
+                    message_id, wait_seconds
                 )
             else:
                 logging.warning(
@@ -1036,7 +1038,7 @@ async def create_or_move_global_status(event=None, force_new=False):
         # 新链接创建的是一条全新的状态消息：发送本身立即可见，
         # 从这次发送开始计算整条状态消息的 5 秒周期。
         STATUS_EDIT_NEXT_ALLOWED[GLOBAL_STATUS_MESSAGE.id] = (
-            time.monotonic() + STATUS_EDIT_MIN_INTERVAL
+            time.monotonic() + 1.0
         )
 
     save_persistent_queue()
