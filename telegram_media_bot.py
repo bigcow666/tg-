@@ -60,7 +60,7 @@ ALBUM_DIAGNOSTIC_MODE = True
 GROUP_PROBE_RADIUS = 30
 
 # 同时运行的转存任务数量；超过这个数量的任务进入 FIFO 队列
-MAX_CONCURRENT_TASKS = 1
+MAX_CONCURRENT_TASKS = 2
 
 # 单个大文件的 Telegram 分块下载设置
 # 单文件 Telegram 分块下载：动态并发
@@ -166,14 +166,9 @@ if ENABLE_USER_LOGIN and USER_SESSION_STRING.strip():
 
 
 def get_source_client():
-    """来源读取客户端；上传、命令、状态消息仍然使用机器人 client。"""
-    if ENABLE_USER_LOGIN:
-        if user_client is None:
-            raise RuntimeError(
-                "已启用用户登录，但 USER_SESSION_STRING 为空。"
-            )
-        return user_client
+    """默认永远使用机器人 client 作为基础读取端。"""
     return client
+
 # <<< 修改结束
 
 # ============================================================
@@ -1006,27 +1001,36 @@ async def create_or_move_global_status(event=None, force_new=False):
         GLOBAL_LAST_USER_MESSAGE_ID = getattr(event, "id", None)
         GLOBAL_STATUS_CHAT_ID = int(event.chat_id or event.sender_id)
 
-    old = GLOBAL_STATUS_MESSAGE
-    if old is not None and force_new:
-        old_id = getattr(old, "id", None)
-        try:
-            await old.delete()
-        except Exception as e:
-            logging.info("Old global status delete skipped: %s", e)
-        await cleanup_status_message_state(old_id)
+    if force_new:
+        # 1. 强制清理旧消息：不依赖内存对象，直接用 ID 暴力强杀
+        if GLOBAL_STATUS_CHAT_ID and GLOBAL_STATUS_MESSAGE_ID:
+            try:
+                await client.delete_messages(
+                    GLOBAL_STATUS_CHAT_ID, 
+                    [int(GLOBAL_STATUS_MESSAGE_ID)]
+                )
+            except Exception as e:
+                logging.info("Old global status delete skipped: %s", e)
+            
+            await cleanup_status_message_state(GLOBAL_STATUS_MESSAGE_ID)
+        
+        # 2. 彻底清空，确保下方一定会触发新建逻辑
         GLOBAL_STATUS_MESSAGE = None
         GLOBAL_STATUS_MESSAGE_ID = None
+    else:
+        # 正常恢复流程：内存为空但有 ID 时，尝试获取旧消息继续用
+        if GLOBAL_STATUS_MESSAGE is None and GLOBAL_STATUS_CHAT_ID and GLOBAL_STATUS_MESSAGE_ID:
+            try:
+                fetched = await client.get_messages(
+                    GLOBAL_STATUS_CHAT_ID, ids=int(GLOBAL_STATUS_MESSAGE_ID)
+                )
+                if isinstance(fetched, list):
+                    fetched = fetched[0] if fetched else None
+                GLOBAL_STATUS_MESSAGE = fetched
+            except Exception:
+                GLOBAL_STATUS_MESSAGE = None
 
-    if GLOBAL_STATUS_MESSAGE is None and GLOBAL_STATUS_CHAT_ID and GLOBAL_STATUS_MESSAGE_ID:
-        try:
-            GLOBAL_STATUS_MESSAGE = await client.get_messages(
-                GLOBAL_STATUS_CHAT_ID, ids=int(GLOBAL_STATUS_MESSAGE_ID)
-            )
-            if isinstance(GLOBAL_STATUS_MESSAGE, list):
-                GLOBAL_STATUS_MESSAGE = GLOBAL_STATUS_MESSAGE[0] if GLOBAL_STATUS_MESSAGE else None
-        except Exception:
-            GLOBAL_STATUS_MESSAGE = None
-
+    # 3. 如果依然为空（被强杀或获取失败），在最底部发送干干净净的新消息
     if GLOBAL_STATUS_MESSAGE is None and GLOBAL_STATUS_CHAT_ID:
         reply_to = GLOBAL_LAST_USER_MESSAGE_ID if GLOBAL_LAST_USER_MESSAGE_ID else None
         GLOBAL_STATUS_MESSAGE = await client.send_message(
@@ -1035,8 +1039,8 @@ async def create_or_move_global_status(event=None, force_new=False):
             reply_to=reply_to,
         )
         GLOBAL_STATUS_MESSAGE_ID = GLOBAL_STATUS_MESSAGE.id
-        # 新链接创建的是一条全新的状态消息：发送本身立即可见，
-        # 从这次发送开始计算整条状态消息的 5 秒周期。
+        
+        # 给新消息挂上 1 秒的首发缓冲锁，保证秒回后的迅速刷新
         STATUS_EDIT_NEXT_ALLOWED[GLOBAL_STATUS_MESSAGE.id] = (
             time.monotonic() + 1.0
         )
@@ -1355,6 +1359,11 @@ async def download_message_parallel(
 
     media_file = getattr(message, "file", None)
     total_size = getattr(media_file, "size", None)
+    
+    # --- 新增：精准打印使用的身份，清理之前的错误修改 ---
+    current_identity = "👤 个人号" if source_client is user_client else "🤖 Bot"
+    logging.info("🚀 开始下载鉴定: file=%s identity=[%s]", getattr(media_file, "name", "未知"), current_identity)
+    # ------------------------------    
 
     # ====== 核心新增：提前计算文件名，并执行单文件完整跳过检查 ======
     output_name = getattr(media_file, "name", None) or f"media_{getattr(message, 'id', index)}"
@@ -1397,10 +1406,11 @@ async def download_message_parallel(
             icon = "🎬" if getattr(message, "video", False) else "🖼"
             last_update[0] = now
             try:
+                current_id_label = "👤个人号" if source_client is user_client else "🤖Bot"
                 await edit_status(
                     status_message,
-                    f"📥 下载 {index}/{total_files}\n\n"
-                    f"{icon} {get_display_name(message)}\n"
+                    f"📥 下载 {index}/{total_files} | {current_id_label}\n\n"
+                    f"{icon} {get_display_name(message)}\n"                    
                     f"{progress_bar(percent)} {percent:5.1f}%\n"
                     f"{format_bytes(current)} / {format_bytes(total)}\n"
                     f"速度：{format_bytes(speed)}/s\n"
@@ -1452,9 +1462,10 @@ async def download_message_parallel(
         last_update = now
 
         try:
+            current_id_label = "👤个人号" if source_client is user_client else "🤖Bot"
             await edit_status(
                 status_message,
-                f"📥 下载 {index}/{total_files}\n\n"
+                f"📥 下载 {index}/{total_files} | {current_id_label}\n\n"
                 f"🎬 {Path(output_name).name}\n"
                 f"{progress_bar(percent)} {percent:5.1f}%\n"
                 f"{format_bytes(downloaded)} / {format_bytes(total_size)}\n"
@@ -2684,6 +2695,7 @@ async def start_handler(event):
     await event.reply(
         "媒体转存 Bot\n\n"
         "直接发送 Telegram 消息链接即可转存。\n\n"
+        "【控制命令】\n"
         "/target - 设置你的目标群\n"
         "/status - 查看设置\n"
         "/queue - 查看队列\n"
@@ -2691,9 +2703,13 @@ async def start_handler(event):
         "/cancelall - 取消你的全部任务\n"
         "/clearqueue - 清空任务队列（不删缓存）\n"
         "/clearcache - 手动清理缓存\n\n"
-        "链接格式：\n"
+        "【链接格式与高级玩法】\n"
+        "🔗 默认转存（自动智能分配身份）：\n"
         "https://t.me/channel/123\n"
-        "https://t.me/c/1234567890/123"
+        "https://t.me/c/1234567890/123\n\n"
+        "👤 强制提权（强制使用个人号下载）：\n"
+        "在链接最后加上空格和 -r\n"
+        "https://t.me/channel/123 -r"
     )
 
 
@@ -2996,68 +3012,88 @@ async def run_transfer(event, link, status_message=None, cache_dir=None):
     peer, message_id = parsed
     target = user["target"]
 
-    # >>> 修改开始：评论链接先解析关联讨论群和评论消息
-    comment_id = parse_comment_id(link)
-    if comment_id is not None:
-        if not ENABLE_USER_LOGIN or user_client is None:
-            await edit_status(
-                status_message,
-                "❌ 这是评论区链接，请先启用普通用户登录并配置 USER_SESSION_STRING。",
-            )
-            return False
-        source_client = user_client
-    else:
-        source_client = get_source_client()
+    # >>> 修改开始：解析强制用户号标记和评论区参数
+    force_user = " -r" in link
+    clean_link = link.replace(" -r", "").strip()
+    comment_id = parse_comment_id(clean_link)
+    # <<< 修改结束
 
     # 新任务优先复用已经存在的完整缓存；没有才创建新缓存目录。
     if cache_dir:
         task_dir = Path(cache_dir)
         mark_cache_in_use(task_dir)
     else:
-        # 强制将目录名与频道ID和消息ID绑定，绝不随机
         safe_peer = str(peer).replace("-", "n")
         task_dir = CACHE_DIR / f"task_{safe_peer}_{message_id}"
         task_dir.mkdir(parents=True, exist_ok=True)
         mark_cache_in_use(task_dir)
 
     try:
-        # 保留原来的状态流程：队列消息进入 worker 后，立即切换到
-        # “正在读取链接消息”，后面的找到媒体/下载/切片/上传进度继续编辑同一条。
         if status_message is not None:
             await edit_status(
                 status_message,
                 "🔎 正在读取链接消息..."
             )
 
-        # >>> 修改开始：普通链接与评论链接分别读取；评论缓存键使用讨论群+评论 ID
+        # >>> 修改开始：智能三级回退 + 强制指定逻辑
+        source_client = None
+        source_peer = None
+        source_message_id = None
+        linked_message = None
+
         if comment_id is not None:
-            source_peer, linked_message = await get_comment_message(
-                peer,
-                message_id,
-                comment_id,
-            )
+            # 分支 1：评论区专属（必须用个人号）
+            if not ENABLE_USER_LOGIN or user_client is None:
+                await edit_status(
+                    status_message,
+                    "❌ 这是评论区链接，请先启用普通用户登录并配置 USER_SESSION_STRING。"
+                )
+                return False
+            
+            source_peer, linked_message = await get_comment_message(peer, message_id, comment_id)
             source_message_id = comment_id
+            source_client = user_client
+            
             if source_peer is None or linked_message is None:
                 await edit_status(
                     status_message,
-                    "❌ 找不到评论消息。请确认普通账号能访问关联讨论群，且评论 ID 正确。",
+                    "❌ 找不到评论消息。请确认普通账号能访问关联讨论群，且评论 ID 正确。"
                 )
                 return False
         else:
+            # 普通频道/群组消息处理
             source_peer = peer
             source_message_id = message_id
-            linked_message = await get_linked_message(
-                peer,
-                message_id,
-                source_client=source_client,
-            )
+            
+            if force_user and ENABLE_USER_LOGIN and user_client:
+                # 分支 2：链接带了 -r，强制直接用个人号
+                source_client = user_client
+                try:
+                    linked_message = await get_linked_message(peer, message_id, source_client=source_client)
+                except Exception:
+                    linked_message = None
+            else:
+                # 分支 3：默认优先让 Bot 干活
+                source_client = client
+                try:
+                    linked_message = await get_linked_message(peer, message_id, source_client=source_client)
+                except Exception:
+                    linked_message = None
+                
+                # 分支 4：智能回退（Bot 无权限且配了个人号，自动切个人号兜底重试）
+                if not linked_message and ENABLE_USER_LOGIN and user_client:
+                    source_client = user_client
+                    try:
+                        linked_message = await get_linked_message(peer, message_id, source_client=source_client)
+                    except Exception:
+                        linked_message = None
 
-        if not linked_message:
-            await edit_status(
-                status_message,
-                "❌ 找不到这个消息。请确认当前来源账号有权限访问源群/频道。"
-            )
-            return False
+            if not linked_message:
+                await edit_status(
+                    status_message,
+                    "❌ 找不到这个消息。请确认 Bot 或普通账号有权限访问该群组/频道。"
+                )
+                return False
         # <<< 修改结束
 
         if not linked_message.media:
@@ -3215,14 +3251,27 @@ async def link_handler(event):
         return
 
     # 一条消息中允许粘贴任意多个 Telegram 链接。
+    # 一条消息中允许粘贴任意多个 Telegram 链接。
     links = []
     seen = set()
+    
+    # 检查整条消息是否带有全局的 -r 强制指令
+    global_force_user = bool(re.search(r"\b-r\b", event.raw_text))
+
     for match in TG_LINK_RE.finditer(event.raw_text):
         link_text = match.group(0)
         parsed = parse_message_link(link_text)
         if not parsed:
             continue
+            
         normalized = link_text.strip()
+        
+        # 如果整条消息带 -r，或者当前链接后面紧跟 -r，就给该链接字符串打上标记
+        tail = event.raw_text[match.end():]
+        if global_force_user or re.match(r"^[ \t]+-r\b", tail):
+            if not normalized.endswith(" -r"):
+                normalized += " -r"
+                
         if normalized not in seen:
             seen.add(normalized)
             links.append((normalized, parsed))
@@ -3509,7 +3558,8 @@ async def main():
         for job in restored_jobs:
             await JOB_QUEUE.put(job)
         try:
-            await create_or_move_global_status(force_new=False)
+            # 找到这行！把里面的 force_new=False 改成 True！
+            await create_or_move_global_status(force_new=True) 
             await refresh_global_status()
         except Exception:
             logging.exception("Failed to restore global status message.")
