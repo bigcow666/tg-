@@ -505,13 +505,33 @@ def _manifest_matches(data, peer, message_id):
 def _valid_cached_files(task_dir, data):
     if not data or not data.get("ready"):
         return []
+
+    rel_files = data.get("output_files", [])
+    if not isinstance(rel_files, list) or not rel_files:
+        return []
+
     result = []
-    for rel in data.get("output_files", []):
-        path = (Path(task_dir) / rel).resolve()
-        root = Path(task_dir).resolve()
+    seen = set()
+    root = Path(task_dir).resolve()
+
+    for rel in rel_files:
+        path = (root / str(rel)).resolve()
+
+        # 缓存清单中同一个路径出现多次，说明不同消息可能被同名文件覆盖。
+        # 这种缓存不能标记为完整，也不能拿来复用。
+        if path in seen:
+            logging.warning(
+                "Rejecting cache with duplicate output path: task=%s file=%s",
+                task_dir,
+                path,
+            )
+            return []
+        seen.add(path)
+
         if root not in path.parents or not path.is_file() or path.stat().st_size <= 0:
             return []
         result.append(path)
+
     return result
 
 
@@ -1365,11 +1385,20 @@ async def download_message_parallel(
     logging.info("🚀 开始下载鉴定: file=%s identity=[%s]", getattr(media_file, "name", "未知"), current_identity)
     # ------------------------------    
 
-    # ====== 核心新增：提前计算文件名，并执行单文件完整跳过检查 ======
-    output_name = getattr(media_file, "name", None) or f"media_{getattr(message, 'id', index)}"
-    if is_telegram_video(message) and Path(output_name).suffix.lower() in ("", ".bin"):
-        output_name = f"{Path(output_name).stem}.mp4"
-    output_path = Path(task_dir) / output_name
+    # 每条 Telegram 消息使用独立文件名，避免同一媒体组内同名文件互相覆盖。
+    # 同一条消息重试时 message.id 不变，因此仍可命中自己的完整文件。
+    task_dir = Path(task_dir)
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_name = getattr(media_file, "name", None) if media_file else None
+    raw_name = Path(str(raw_name)).name if raw_name else f"media_{getattr(message, 'id', index)}"
+    name_path = Path(raw_name)
+    if is_telegram_video(message) and name_path.suffix.lower() in ("", ".bin"):
+        name_path = name_path.with_suffix(".mp4")
+
+    message_id = getattr(message, "id", index)
+    output_name = f"{name_path.stem}_msg{message_id}{name_path.suffix}"
+    output_path = task_dir / output_name
 
     if total_size and output_path.is_file() and output_path.stat().st_size == total_size:
         if status_message:
@@ -1419,8 +1448,10 @@ async def download_message_parallel(
             except Exception:
                 pass
 
+        # 必须传入完整目标文件路径，不能只传目录；否则 Telethon 会按原始
+        # 文件名落盘，同名媒体会覆盖前一条消息。
         path = await message.download_media(
-            file=str(task_dir),
+            file=str(output_path),
             progress_callback=progress,
         )
         return await ensure_video_extension_ffprobe(
@@ -2599,8 +2630,13 @@ async def process_album(messages, target, task_dir, status_message=None, source_
 
     downloaded = []
 
-    # 按 Telegram message ID 保持原始媒体组顺序
-    messages = sorted(messages, key=lambda m: m.id)
+    # 只处理媒体消息，并按 Telegram message ID 保持原始媒体组顺序。
+    messages = sorted(
+        (m for m in messages if getattr(m, "media", None)),
+        key=lambda m: m.id,
+    )
+    if not messages:
+        return 0
 
     for message in messages:
         path = await download_message(
@@ -2611,10 +2647,13 @@ async def process_album(messages, target, task_dir, status_message=None, source_
             total_files=len(messages),
         )
 
-        if path:
-            downloaded.append(
-                (message, path)
+        if not path or not Path(path).is_file() or Path(path).stat().st_size <= 0:
+            raise RuntimeError(
+                f"媒体组下载不完整：message_id={message.id}，未生成有效文件；"
+                "不会将该媒体组登记为 ready 缓存。"
             )
+
+        downloaded.append((message, path))
 
         # 不在下载过程中因为缓存瞬时超过上限而中止任务。
         # MAX_CACHE_GB 仅作为新任务建立时的最后容量保底，由 ensure_cache_room() 处理。
