@@ -47,7 +47,7 @@ DEFAULT_TARGET_CHAT_ID = -1001234567890
 MAX_CACHE_GB = 30
 
 # 视频超过这个大小就按关键帧切分；不重新编码
-SPLIT_SIZE_MB = 1500
+SPLIT_SIZE_MB = 1900
 
 # Album 诊断模式：
 # False = 正常运行
